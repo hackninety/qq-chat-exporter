@@ -1,0 +1,121 @@
+name: 自动同步上游仓库
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions 无法直接订阅另一个仓库的 push，因此每小时检查一次。
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream-${{ github.event.repository.default_branch }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: shuakami/qq-chat-exporter
+  CONFLICT_ISSUE_TITLE: "[自动同步] 上游代码合并冲突"
+
+jobs:
+  sync:
+    name: 合并上游更新
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Merge and push upstream changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          upstream_branch="$(gh api "repos/${UPSTREAM_REPOSITORY}" --jq '.default_branch')"
+          git fetch --no-tags upstream \
+            "+refs/heads/${upstream_branch}:refs/remotes/upstream/${upstream_branch}"
+          upstream_ref="upstream/${upstream_branch}"
+          upstream_sha="$(git rev-parse "${upstream_ref}")"
+
+          find_conflict_issue() {
+            gh issue list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --state open \
+              --limit 100 \
+              --json number,title | \
+              jq -r --arg title "${CONFLICT_ISSUE_TITLE}" \
+                'map(select(.title == $title)) | .[0].number // empty'
+          }
+
+          close_conflict_issue() {
+            local issue_number
+            issue_number="$(find_conflict_issue)"
+            if [ -n "${issue_number}" ]; then
+              gh issue close "${issue_number}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --reason completed \
+                --comment "上游提交 \`${upstream_sha}\` 已成功同步，自动关闭此提醒。"
+            fi
+          }
+
+          if git merge-base --is-ancestor "${upstream_ref}" HEAD; then
+            echo "Fork 已包含上游最新提交 ${upstream_sha}。"
+            close_conflict_issue
+            exit 0
+          fi
+
+          if ! git merge --no-edit "${upstream_ref}"; then
+            conflict_files="$(git diff --name-only --diff-filter=U || true)"
+            git merge --abort || true
+
+            issue_body="${RUNNER_TEMP}/upstream-sync-conflict.md"
+            {
+              echo '自动同步无法完成，需要人工或 AI 处理合并冲突。'
+              echo
+              echo "- 上游仓库：\`${UPSTREAM_REPOSITORY}\`"
+              echo "- 上游分支：\`${upstream_branch}\`"
+              echo "- 上游提交：\`${upstream_sha}\`"
+              echo "- 目标分支：\`${TARGET_BRANCH}\`"
+              echo "- 工作流运行：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+              echo
+              echo '冲突文件：'
+              echo '```text'
+              if [ -n "${conflict_files}" ]; then
+                echo "${conflict_files}"
+              else
+                echo 'Git 未返回具体冲突文件，请查看工作流日志。'
+              fi
+              echo '```'
+              echo
+              echo '可将此 Issue 和工作流链接交给 Codex，要求分析并解决冲突后重新运行同步。'
+            } > "${issue_body}"
+
+            issue_number="$(find_conflict_issue)"
+            if [ -n "${issue_number}" ]; then
+              gh issue comment "${issue_number}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --body-file "${issue_body}"
+            else
+              gh issue create \
+                --repo "${GITHUB_REPOSITORY}" \
+                --title "${CONFLICT_ISSUE_TITLE}" \
+                --body-file "${issue_body}" \
+                --assignee "${GITHUB_REPOSITORY_OWNER}"
+            fi
+
+            exit 1
+          fi
+
+          git push origin "HEAD:${TARGET_BRANCH}"
+          close_conflict_issue
