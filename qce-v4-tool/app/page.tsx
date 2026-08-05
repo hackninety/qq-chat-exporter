@@ -23,6 +23,7 @@ const ScheduledExportWizard = lazy(() => import("@/components/ui/scheduled-expor
 const ExecutionHistoryModal = lazy(() => import("@/components/ui/execution-history-modal").then(m => ({ default: m.ExecutionHistoryModal })))
 const MessagePreviewModal = lazy(() => import("@/components/ui/message-preview-modal").then(m => ({ default: m.MessagePreviewModal })))
 const BatchExportDialog = lazy(() => import("@/components/ui/batch-export-dialog").then(m => ({ default: m.BatchExportDialog })))
+const AccountExportDialog = lazy(() => import("@/components/ui/account-export-dialog").then(m => ({ default: m.AccountExportDialog })))
 const ScheduledBackupMergeDialog = lazy(() => import("@/components/ui/scheduled-backup-merge-dialog").then(m => ({ default: m.ScheduledBackupMergeDialog })))
 const GroupEssenceModal = lazy(() => import("@/components/ui/group-essence-modal").then(m => ({ default: m.GroupEssenceModal })))
 const GroupFilesModal = lazy(() => import("@/components/ui/group-files-modal").then(m => ({ default: m.GroupFilesModal })))
@@ -67,6 +68,7 @@ import {
   CheckCircle,
   Smile,
   Package,
+  Archive,
   Sticker,
   Layers,
   Combine,
@@ -112,6 +114,9 @@ import { motion, AnimatePresence, useReducedMotion } from "framer-motion"
 import { DUR, EASE, makeStagger } from "@/components/qce-dashboard/animations"
 
 function TaskFormatLabel({ format, className }: { format: string; className?: string }) {
+  if (format === "QCEARCHIVE_ACCOUNT") {
+    return <span className={className}>全账号 QCE Archive</span>
+  }
   if (format === "STREAMING_ZIP" || format === "STREAMING_JSONL") {
     const suffix = format === "STREAMING_ZIP" ? "ZIP" : "JSONL"
     return (
@@ -138,6 +143,10 @@ function TaskFormatLabel({ format, className }: { format: string; className?: st
     return <span className={className}>QCE Archive</span>
   }
   return <span className={className}>{format}</span>
+}
+
+function isCompletedTaskStatus(status: string) {
+  return status === "completed" || status === "completed_with_warnings"
 }
 
 /**
@@ -222,6 +231,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
   const [batchMode, setBatchMode] = useState(false)
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set())
   const [isBatchExportDialogOpen, setIsBatchExportDialogOpen] = useState(false)
+  const [isAccountExportDialogOpen, setIsAccountExportDialogOpen] = useState(false)
 
   const {
     data: inactiveSessionsData,
@@ -1387,6 +1397,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
     switch (status) {
       case "running": return "进行中"
       case "completed": return "已完成"
+      case "completed_with_warnings": return "完成但有缺失"
       case "failed": return "失败"
       case "cancelled": return "已停止"
       default: return "等待中"
@@ -1982,7 +1993,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                             <span className="text-sm font-medium text-foreground truncate">{task.sessionName}</span>
                             <Badge
                               className={`text-[11px] px-1.5 py-0 rounded-full border-0 ${
-                                task.status === "completed"
+                                isCompletedTaskStatus(task.status)
                                   ? "text-green-700 bg-green-50 dark:text-green-300 dark:bg-green-950/40"
                                   : task.status === "running"
                                   ? "text-blue-700 bg-blue-50 dark:text-blue-300 dark:bg-blue-950/40"
@@ -2008,7 +2019,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                                 <span className="text-xs text-muted-foreground font-medium tabular-nums">{task.progress}%</span>
                               </>
                             )}
-                            {task.status === "completed" && (
+                            {isCompletedTaskStatus(task.status) && (
                               <>
                                 <Button size="sm" variant="ghost" className="h-8 rounded-lg px-2" onClick={() => openFileLocation(task.filePath)} title="打开文件位置">
                                   <FolderOpen className="w-4 h-4" />
@@ -2085,6 +2096,21 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                   </div>
                 ) : (
                   <>
+                    <div className="flex justify-end px-1 pb-1">
+                      <Button
+                        data-testid="account-export-button"
+                        size="sm"
+                        variant="outline"
+                        className="h-8 rounded-full px-3 text-[13px]"
+                        onClick={() => {
+                          setIsAccountExportDialogOpen(true)
+                          if (!chatBackupsLoaded) void loadChatBackups()
+                        }}
+                      >
+                        <Archive className="mr-1.5 h-4 w-4" />
+                        导出整个账号
+                      </Button>
+                    </div>
                     {batchMode && (
                       <div className="text-[13px] text-muted-foreground px-1">
                         已选择 {selectedItems.size} 个会话
@@ -2187,7 +2213,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                           <span className="font-medium text-foreground truncate">{task.sessionName}</span>
                           <Badge
                             className={`text-[11px] px-1.5 py-0 rounded-full border-0 ${
-                              task.status === "completed"
+                              isCompletedTaskStatus(task.status)
                                 ? "text-green-700 bg-green-50 dark:text-green-300 dark:bg-green-950/40"
                                 : task.status === "running"
                                 ? "text-blue-700 bg-blue-50 dark:text-blue-300 dark:bg-blue-950/40"
@@ -2210,7 +2236,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                           {task.messageCount !== undefined && task.messageCount > 0 && (
                             <span className="inline-flex items-center gap-1 whitespace-nowrap">
                               <span>{task.messageCount.toLocaleString()} 条消息</span>
-                              {task.status === "completed" && task.resourceSummary && task.resourceSummary.failed > 0 && (
+                              {isCompletedTaskStatus(task.status) && task.resourceSummary && task.resourceSummary.failed > 0 && (
                                 <Tooltip>
                                   <TooltipTrigger asChild>
                                     <button
@@ -2290,7 +2316,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                             <Square className="w-4 h-4" />
                           </Button>
                         )}
-                        {task.status === "completed" && (
+                        {isCompletedTaskStatus(task.status) && (
                           <>
                             <Button
                               size="sm"
@@ -2312,7 +2338,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                             </Button>
                           </>
                         )}
-                        {(task.status === "completed" || task.status === "failed" || task.status === "cancelled") && (
+                        {(isCompletedTaskStatus(task.status) || task.status === "failed" || task.status === "cancelled") && (
                           <Button
                             size="sm"
                             variant="ghost"
@@ -3246,6 +3272,18 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
         onOpenChange={setIsBatchExportDialogOpen}
         items={getBatchExportItems()}
         onExport={handleBatchExport}
+      />
+
+      <AccountExportDialog
+        open={isAccountExportDialogOpen}
+        onOpenChange={setIsAccountExportDialogOpen}
+        imports={chatBackupImports}
+        importsLoading={chatBackupsLoading}
+        account={systemInfo?.napcat.selfInfo}
+        onStarted={() => {
+          addNotification("success", "全账号归档已创建", "可在任务页查看会话、消息和资源进度。")
+          void loadTasks()
+        }}
       />
 
       <ScheduledBackupMergeDialog

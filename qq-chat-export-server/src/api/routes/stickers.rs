@@ -433,7 +433,10 @@ fn system_packs() -> Vec<Value> {
 }
 
 /// 汇总获取表情包列表。
-async fn get_sticker_packs(state: &SharedState, types: Option<&Vec<String>>) -> Vec<Value> {
+pub(crate) async fn get_sticker_packs(
+    state: &SharedState,
+    types: Option<&Vec<String>>,
+) -> Vec<Value> {
     let want = |t: &str| types.is_none_or(|list| list.iter().any(|item| item == t));
     let mut packs = Vec::new();
     if want("favorite_emoji") {

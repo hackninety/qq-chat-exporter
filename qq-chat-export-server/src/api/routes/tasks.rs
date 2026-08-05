@@ -138,7 +138,10 @@ pub async fn cancel_task(
         let err = ApiError::not_found("任务不存在", "TASK_NOT_FOUND");
         return response::error(&err, &request_id);
     };
-    if matches!(status.as_str(), "completed" | "failed") {
+    if matches!(
+        status.as_str(),
+        "completed" | "completed_with_warnings" | "failed"
+    ) {
         let err = ApiError::validation("任务已结束", "TASK_ALREADY_FINISHED");
         return response::error(&err, &request_id);
     }

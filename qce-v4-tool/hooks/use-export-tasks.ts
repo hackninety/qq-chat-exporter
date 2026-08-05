@@ -17,7 +17,7 @@ import { useApi } from "./use-api"
 
 const GITHUB_URL = "https://github.com/shuakami/qq-chat-exporter"
 
-type TaskStatus = "running" | "completed" | "failed" | "cancelled"
+type TaskStatus = "running" | "completed" | "completed_with_warnings" | "failed" | "cancelled"
 
 type ProgressPayload = ExportTaskUpdate
 
@@ -261,7 +261,10 @@ export function useExportTasks(_props?: UseExportTasksProps) {
       taskToastIdsRef.current.set(task.id, toastId)
     }
 
-    const isCompleted = task.status === "completed" || data?.status === "completed"
+    const isCompleted = task.status === "completed"
+      || task.status === "completed_with_warnings"
+      || data?.status === "completed"
+      || data?.status === "completed_with_warnings"
     const isFailed = task.status === "failed" || data?.status === "failed"
     const isCancelled = task.status === "cancelled" || data?.status === "cancelled"
 
@@ -793,7 +796,7 @@ export function useExportTasks(_props?: UseExportTasksProps) {
     let failed = 0
     for (const task of tasks) {
       if (task.status === "running") running += 1
-      else if (task.status === "completed") completed += 1
+      else if (task.status === "completed" || task.status === "completed_with_warnings") completed += 1
       else if (task.status === "failed") failed += 1
     }
     return { total: running + completed + failed, running, completed, failed }
@@ -814,7 +817,7 @@ export function useExportTasks(_props?: UseExportTasksProps) {
     for (const task of tasks) {
       if (!taskToastIdsRef.current.has(task.id)) continue
       if (completedToastIdsRef.current.has(task.id)) continue
-      if (task.status === "completed" || task.status === "failed" || task.status === "cancelled") {
+      if (task.status === "completed" || task.status === "completed_with_warnings" || task.status === "failed" || task.status === "cancelled") {
         syncTaskToast(task)
       }
     }

@@ -15,8 +15,8 @@ use tower_http::services::ServeDir;
 
 use qce_server::api::middleware::{auth_middleware, request_id_middleware};
 use qce_server::api::routes::{
-    albums, backup_imports, files, friends, group_files, groups, messages, resources, scheduled,
-    security, stickers, system, tasks, users,
+    account_exports, albums, backup_imports, files, friends, group_files, groups, messages,
+    resources, scheduled, security, stickers, system, tasks, users,
 };
 use qce_server::api::state::{AppState, SharedState};
 use qce_server::api::ws;
@@ -167,6 +167,7 @@ async fn run() -> Result<(), String> {
         export_tasks: Mutex::new(export_tasks),
         cancelled_task_ids: Mutex::new(std::collections::HashSet::new()),
         running_export_cancel_flags: Mutex::new(HashMap::new()),
+        account_export_semaphore: tokio::sync::Semaphore::new(1),
         resource_file_cache: Mutex::new(HashMap::new()),
         message_cache: Mutex::new(HashMap::new()),
         started_at: Instant::now(),
@@ -254,6 +255,14 @@ fn build_router(
         .route("/api/recent-contacts", get(friends::recent_contacts))
         .route("/api/inactive-sessions", get(friends::inactive_sessions))
         .route("/api/chat-backups", get(backup_imports::list_backups))
+        .route(
+            "/api/account-exports/preview",
+            post(account_exports::preview_account_export),
+        )
+        .route(
+            "/api/account-exports",
+            post(account_exports::create_account_export),
+        )
         .route(
             "/api/chat-backups/sessions",
             get(backup_imports::list_backup_sessions),

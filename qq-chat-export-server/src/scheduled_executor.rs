@@ -193,27 +193,18 @@ impl ScheduledExportExecutor for ApiScheduledExportExecutor {
             .into_iter()
             .filter(|t| matches!(t.as_str(), "image" | "video" | "audio" | "file"))
             .collect();
-        if normalized_skip_types.is_empty() {
-            self.resource_handler.set_skip_download_types(None).await;
-        } else {
-            self.resource_handler
-                .set_skip_download_types(Some(&normalized_skip_types))
-                .await;
-        }
-
-        let resource_map = self
+        let (resource_map, batch_summary) = self
             .resource_handler
-            .process_message_resources_with_cancel_and_trace(
+            .process_message_resources_with_batch_config(
                 &all_messages,
                 Arc::new(AtomicBool::new(false)),
                 debug_session.as_ref().map(ExportDebugSession::trace),
+                None,
+                normalized_skip_types,
             )
             .await;
         // issue #363：资源下载摘要。
-        let resource_summary =
-            serde_json::to_value(self.resource_handler.last_batch_summary().await).ok();
-        // 重置共享 ResourceHandler 的状态，避免影响后续任务。
-        self.resource_handler.set_skip_download_types(None).await;
+        let resource_summary = serde_json::to_value(batch_summary).ok();
 
         // 阶段 3：文件名 / 输出目录
         tokio::fs::create_dir_all(&output_dir)

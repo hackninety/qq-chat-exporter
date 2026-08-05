@@ -202,6 +202,40 @@ impl BackupImportManager {
             .map_err(std::io::Error::other)?
     }
 
+    pub async fn get_import(&self, import_id: String) -> Result<BackupImport, BackupImportError> {
+        let imports = self.list_imports().await?;
+        imports
+            .into_iter()
+            .find(|import| import.id == import_id)
+            .ok_or(BackupImportError::NotFound)
+    }
+
+    pub async fn list_sessions_for_import(
+        &self,
+        import_id: String,
+    ) -> Result<Vec<ImportedSession>, BackupImportError> {
+        let import = self.get_import(import_id).await?;
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || list_sessions_for_import(&root, &import))
+            .await
+            .map_err(std::io::Error::other)?
+    }
+
+    pub async fn decrypted_database_path(
+        &self,
+        import_id: String,
+    ) -> Result<PathBuf, BackupImportError> {
+        let import = self.get_import(import_id.clone()).await?;
+        let path = self.root.join(&import.id).join("database.sqlite");
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .map_err(|_| BackupImportError::NotFound)?;
+        if !metadata.is_file() {
+            return Err(BackupImportError::NotFound);
+        }
+        Ok(path)
+    }
+
     pub async fn list_sessions(&self) -> Result<Vec<ImportedSession>, BackupImportError> {
         let imports = self.list_imports().await?;
         let root = self.root.clone();

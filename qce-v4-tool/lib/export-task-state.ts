@@ -3,7 +3,7 @@ import type { ExportTask } from "../types/api"
 export type ExportTaskUpdate = {
   taskId: string
   progress: number
-  status: "running" | "completed" | "failed" | "cancelled"
+  status: "running" | "completed" | "completed_with_warnings" | "failed" | "cancelled"
   message?: string
   messageCount?: number
   error?: string

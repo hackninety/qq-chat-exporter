@@ -1,3 +1,4 @@
+pub mod account_archive_exporter;
 pub mod base;
 pub mod bloom;
 pub mod chunked_jsonl_writer;

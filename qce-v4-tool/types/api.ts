@@ -195,6 +195,34 @@ export interface ChatBackupsResponse {
   imports: ChatBackupImport[]
 }
 
+export interface AccountExportCounts {
+  total: number
+  friend: number
+  nonFriend: number
+  group: number
+  unavailableGroup: number
+  other: number
+}
+
+export interface AccountExportPreview {
+  account: {
+    uid?: string
+    uin?: string
+    name: string
+    avatarUrl?: string
+  }
+  backup: ChatBackupImport
+  counts: AccountExportCounts
+  historicalSessionCount: number
+  currentFriendCount: number
+  currentGroupCount: number
+  localSessionCount: number
+  warningCount: number
+  warnings: Array<{ code: string; message: string }>
+  fixedIncludes: string[]
+  notice: string
+}
+
 export interface ChatBackupKeyDetection {
   required: boolean
   detected: boolean
@@ -217,7 +245,7 @@ export interface ExportTask {
     guildId: string
   }
   sessionName: string
-  status: "pending" | "running" | "completed" | "failed" | "cancelled"
+  status: "pending" | "running" | "completed" | "completed_with_warnings" | "failed" | "cancelled"
   progress: number
   format: string
   startTime?: number
@@ -243,6 +271,11 @@ export interface ExportTask {
    * 后端在 `processMessageResources` 完成后填充；纯文字消息或显式跳过资源下载时为 undefined。
    */
   resourceSummary?: ExportResourceSummary
+  archiveKind?: "account" | "conversation"
+  conversationCount?: number
+  resourceCount?: number
+  missingResourceCount?: number
+  warningCount?: number
 }
 
 /**

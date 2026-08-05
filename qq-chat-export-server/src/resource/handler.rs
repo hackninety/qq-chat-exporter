@@ -178,6 +178,8 @@ pub struct ResourceHandler {
     progress_callback: Mutex<Option<ResourceProgressCallback>>,
     progress: Mutex<ProgressCounters>,
     last_batch_summary: Mutex<ResourceBatchSummary>,
+    /// 单次批处理包含进度和摘要状态；串行化可避免并发任务互相覆盖这些状态。
+    batch_gate: Semaphore,
     download_semaphore: Arc<Semaphore>,
     is_downloading: std::sync::atomic::AtomicBool,
     health_check_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -205,6 +207,7 @@ impl ResourceHandler {
             progress_callback: Mutex::new(None),
             progress: Mutex::new(ProgressCounters::default()),
             last_batch_summary: Mutex::new(ResourceBatchSummary::default()),
+            batch_gate: Semaphore::new(1),
             download_semaphore: Arc::new(Semaphore::new(config.max_concurrent_downloads.max(1))),
             is_downloading: std::sync::atomic::AtomicBool::new(false),
             health_check_handle: Mutex::new(None),
@@ -232,20 +235,6 @@ impl ResourceHandler {
                 handler.perform_scheduled_health_check().await;
             }
         }));
-    }
-
-    /// 设置进度回调。
-    pub async fn set_progress_callback(&self, callback: Option<ResourceProgressCallback>) {
-        *self.progress_callback.lock().await = callback;
-    }
-
-    /// 配置需要跳过下载的资源类型（issue #341）。
-    pub async fn set_skip_download_types(&self, types: Option<&[String]>) {
-        let mut skip = self.skip_download_types.lock().await;
-        skip.clear();
-        if let Some(types) = types {
-            skip.extend(types.iter().cloned());
-        }
     }
 
     /// 触发进度回调。
@@ -304,6 +293,37 @@ impl ResourceHandler {
         cancel_flag: Arc<AtomicBool>,
         debug_trace: Option<ExportDebugTrace>,
     ) -> HashMap<String, Vec<ResourceInfo>> {
+        self.process_message_resources_with_batch_config(
+            messages,
+            cancel_flag,
+            debug_trace,
+            None,
+            Vec::new(),
+        )
+        .await
+        .0
+    }
+
+    /// 使用本次调用私有的回调和跳过类型处理资源，并原子返回该批次摘要。
+    pub async fn process_message_resources_with_batch_config(
+        self: &Arc<Self>,
+        messages: &[Value],
+        cancel_flag: Arc<AtomicBool>,
+        debug_trace: Option<ExportDebugTrace>,
+        progress_callback: Option<ResourceProgressCallback>,
+        skip_download_types: Vec<String>,
+    ) -> (HashMap<String, Vec<ResourceInfo>>, ResourceBatchSummary) {
+        let _batch_permit = self
+            .batch_gate
+            .acquire()
+            .await
+            .expect("resource batch gate is never closed");
+        *self.progress_callback.lock().await = progress_callback;
+        {
+            let mut skip = self.skip_download_types.lock().await;
+            skip.clear();
+            skip.extend(skip_download_types);
+        }
         {
             let mut progress = self.progress.lock().await;
             *progress = ProgressCounters::default();
@@ -381,7 +401,7 @@ impl ResourceHandler {
         }
 
         // 计算本批次摘要（issue #363）
-        {
+        let summary = {
             let mut summary = self.last_batch_summary.lock().await;
             for (resource, initial) in &all_resources {
                 summary.attempted += 1;
@@ -416,7 +436,8 @@ impl ResourceHandler {
                     }
                 }
             }
-        }
+            summary.clone()
+        };
 
         // 输出最终资源快照
         let mut result: HashMap<String, Vec<ResourceInfo>> = HashMap::new();
@@ -427,12 +448,9 @@ impl ResourceHandler {
             }
             result.insert(msg_id, list);
         }
-        result
-    }
-
-    /// 读取上一次批处理摘要（issue #363）。
-    pub async fn last_batch_summary(&self) -> ResourceBatchSummary {
-        self.last_batch_summary.lock().await.clone()
+        *self.progress_callback.lock().await = None;
+        self.skip_download_types.lock().await.clear();
+        (result, summary)
     }
 
     /// 处理单个媒体元素：提取信息、合并缓存、健康检查、判定初始状态并写库。

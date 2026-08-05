@@ -254,3 +254,8 @@ These rules apply when the developer has not given explicit guidance. Unless the
 
 All of the rules above can be bypassed when the developer provides explicit guidance.
 - `scripts/quick-pack.py` contains embedded Windows batch content and uses CRLF line endings. Edit it with byte-preserving replacements; do not rewrite the whole file or normalize trailing whitespace.
+
+## 10. 当前仓库存档约定
+
+- 每轮产生并验证了相关代码改动后，使用中文 conventional commit 提交并推送当前非保护分支。
+- 无改动不创建空提交，不混入无关用户文件。

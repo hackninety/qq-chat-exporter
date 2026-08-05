@@ -17,7 +17,7 @@ export function useQCE(props?: { onNotification?: UseExportTasksProps['onNotific
   const websocket = useWebSocket({
     onExportProgress: (data) => {
       // Legacy progress message support
-      const status = data.status as "running" | "completed" | "failed" | "cancelled"
+      const status = data.status as "running" | "completed" | "completed_with_warnings" | "failed" | "cancelled"
       exportTasks.updateTaskProgress(data.taskId, data.progress, status)
     },
     onProgressUpdate: (data) => {

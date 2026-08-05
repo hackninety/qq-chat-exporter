@@ -46,7 +46,7 @@ fn now_ms() -> i64 {
 }
 
 /// 当前 ISO 时间串。
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
@@ -245,7 +245,7 @@ fn reserved_export_paths() -> &'static Mutex<HashSet<PathBuf>> {
 }
 
 /// 为运行中的任务预留唯一输出路径；预留项在任务结束时释放。
-fn reserve_export_file_name(output_dir: &FsPath, file_name: &str) -> String {
+pub(crate) fn reserve_export_file_name(output_dir: &FsPath, file_name: &str) -> String {
     let mut reserved = reserved_export_paths()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -264,7 +264,7 @@ fn reserve_export_file_name(output_dir: &FsPath, file_name: &str) -> String {
     unreachable!("u32 filename suffix space exhausted")
 }
 
-fn release_export_path(path: &FsPath) {
+pub(crate) fn release_export_path(path: &FsPath) {
     reserved_export_paths()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -272,7 +272,7 @@ fn release_export_path(path: &FsPath) {
 }
 
 /// Issue #192：根据是否使用自定义路径生成下载 URL。
-fn generate_download_url(
+pub(crate) fn generate_download_url(
     file_path: &FsPath,
     file_name: &str,
     custom_output_dir: &str,
@@ -287,7 +287,7 @@ fn generate_download_url(
 }
 
 /// 生成 `export_{ms}_{rand9}` 风格任务 ID。
-fn generate_task_id(prefix: &str) -> String {
+pub(crate) fn generate_task_id(prefix: &str) -> String {
     let rand: String = uuid::Uuid::new_v4()
         .simple()
         .to_string()
@@ -298,7 +298,7 @@ fn generate_task_id(prefix: &str) -> String {
 }
 
 /// 本地日期 / 时间字符串（YYYYMMDD / HHMMSSmmm）。
-fn local_date_time_strings() -> (String, String) {
+pub(crate) fn local_date_time_strings() -> (String, String) {
     let now = chrono::Local::now();
     (
         now.format("%Y%m%d").to_string(),
@@ -379,7 +379,7 @@ fn apply_sender_filter(messages: Vec<Value>, filter: &Value) -> Vec<Value> {
 }
 
 /// 更新内存任务表并持久化到数据库。
-async fn update_task(state: &SharedState, task_id: &str, patch: Value) {
+pub(crate) async fn update_task(state: &SharedState, task_id: &str, patch: Value) {
     let updated = {
         let mut tasks = state.export_tasks.lock().await;
         let Some(task) = tasks.get_mut(task_id) else {
@@ -410,7 +410,7 @@ fn should_apply_task_patch(task: &Value, patch: &Value) -> bool {
 }
 
 /// 广播导出进度。
-fn broadcast_progress(
+pub(crate) fn broadcast_progress(
     state: &SharedState,
     task_id: &str,
     progress: i64,
@@ -755,7 +755,7 @@ fn export_task_peer(req: &ExportRequest) -> Value {
     peer
 }
 
-async fn prepare_output_directory(
+pub(crate) async fn prepare_output_directory(
     requested_output_dir: &FsPath,
     output_roots: &[PathBuf],
 ) -> Result<PathBuf, ApiError> {
@@ -890,7 +890,7 @@ async fn prepare_export_request(
 }
 
 /// 创建任务记录、入表并持久化。
-async fn register_task(state: &SharedState, task: &Value) -> bool {
+pub(crate) async fn register_task(state: &SharedState, task: &Value) -> bool {
     let task_id = task
         .get("taskId")
         .and_then(Value::as_str)
@@ -1392,7 +1392,11 @@ async fn fetch_group_member_title_map(
 }
 
 /// 补全群消息的群昵称（sendMemberName）。
-async fn fill_group_member_names(state: &SharedState, peer_uid: &str, messages: &mut [Value]) {
+pub(crate) async fn fill_group_member_names(
+    state: &SharedState,
+    peer_uid: &str,
+    messages: &mut [Value],
+) {
     let Ok(group_members) = state.napcat.get_group_member_all(peer_uid, false).await else {
         return;
     };
@@ -1431,7 +1435,7 @@ async fn fill_group_member_names(state: &SharedState, peer_uid: &str, messages: 
 }
 
 /// 把 ResourceHandler 的资源映射转成导出器的 `resource_map`。
-fn to_exporter_resource_map(
+pub(crate) fn to_exporter_resource_map(
     resource_map: &HashMap<String, Vec<ResourceInfo>>,
 ) -> HashMap<String, Vec<MessageResource>> {
     resource_map
@@ -1794,15 +1798,13 @@ async fn process_export_task(
         let state_cb = Arc::clone(state);
         let task_id_cb = task_id.to_string();
         let count_cb = filtered_messages.len();
-        state
-            .resource_handler
-            .set_progress_callback(Some(Arc::new(move |progress| {
+        let progress_callback: crate::resource::ResourceProgressCallback =
+            Arc::new(move |progress| {
                 let percent = 70
                     + ((progress.completed as f64 / progress.total.max(1) as f64) * 15.0).round()
                         as i64;
                 broadcast_progress(&state_cb, &task_id_cb, percent, &progress.message, count_cb);
-            })))
-            .await;
+            });
 
         // Issue #341：跳过下载的资源类型（仅保留元数据）。
         let requested_skip_types: Vec<String> = req
@@ -1828,30 +1830,24 @@ async fn process_export_task(
             .into_iter()
             .filter(|t| matches!(t.as_str(), "image" | "video" | "audio" | "file"))
             .collect();
-        if normalized_skip_types.is_empty() {
-            state.resource_handler.set_skip_download_types(None).await;
-        } else {
+        if !normalized_skip_types.is_empty() {
             tracing::info!(
                 "[ApiServer] 跳过下载的资源类型: {}",
                 normalized_skip_types.join(", ")
             );
-            state
-                .resource_handler
-                .set_skip_download_types(Some(&normalized_skip_types))
-                .await;
         }
 
-        resource_map = state
+        let (processed_resources, summary) = state
             .resource_handler
-            .process_message_resources_with_cancel_and_trace(
+            .process_message_resources_with_batch_config(
                 &resource_messages,
                 Arc::clone(cancel_flag),
                 debug_session.as_ref().map(ExportDebugSession::trace),
+                Some(progress_callback),
+                normalized_skip_types,
             )
             .await;
-        let summary = state.resource_handler.last_batch_summary().await;
-        state.resource_handler.set_progress_callback(None).await;
-        state.resource_handler.set_skip_download_types(None).await;
+        resource_map = processed_resources;
         tracing::info!(
             "[ApiServer] 处理了 {} 个消息的资源（attempted={}, downloaded={}, alreadyAvailable={}, failed={}, skipped={}）",
             resource_map.len(),

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::Value;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 
 use crate::backup_import::BackupImportManager;
 use crate::napcat::NapCatBridgeClient;
@@ -58,6 +58,8 @@ pub struct AppState {
     pub cancelled_task_ids: Mutex<std::collections::HashSet<String>>,
     /// issue #446：运行中任务的取消信号（taskId → 取消 flag）。
     pub running_export_cancel_flags: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// 全账号归档会长时间占用消息与资源接口，同一时间只运行一个。
+    pub account_export_semaphore: Semaphore,
     /// 资源文件名缓存（dirPath → (shortName → fullFileName)）。
     pub resource_file_cache: Mutex<HashMap<String, HashMap<String, String>>>,
     /// 消息缓存（peerKey → 缓存条目）。

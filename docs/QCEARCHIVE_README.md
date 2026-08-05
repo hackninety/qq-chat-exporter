@@ -1,11 +1,22 @@
 # QCE Archive (`.qcearchive`) 解析说明
 
-`.qcearchive` 是 QQ Chat Exporter 用于二次开发和离线检索的自描述归档格式。文件本身是一个 ZIP 容器，扩展名固定为 `.qcearchive`。解析工具应先把它解压到临时目录，再以只读方式打开 `messages.sqlite`。
+`.qcearchive` 是 QQ Chat Exporter 提供给离线读取、检索和二次开发工具的自描述归档。文件是 ZIP（支持 ZIP64），扩展名固定为 `.qcearchive`。归档内 SQLite 均为标准、未加密的 SQLite 3 数据库，读取归档不需要 QQ 登录或 NTQQ 数据库 key。
 
-## 容器结构
+解析器必须先读取 `manifest.json`，再根据 `schemaVersion` 和 `archiveKind` 选择读取方式。不要只根据文件扩展名猜测结构。
+
+## 版本与兼容性
+
+| schemaVersion | archiveKind | 说明 |
+| --- | --- | --- |
+| 1 | 缺省为 `conversation` | 单个私聊或群聊归档 |
+| 2 | `account` | 一个 QQ 账号的一次完整导出快照，可包含多个会话和资源集合 |
+
+解析器应忽略未知的可选 manifest 字段、SQLite 列、表和索引；遇到未知的更高 `schemaVersion` 时可以拒绝读取。v1 的字段和表保持兼容，v2 不改变既有 v1 文件。
+
+## v1：单会话归档
 
 ```text
-archive.qcearchive
+conversation.qcearchive
 ├─ manifest.json
 ├─ messages.sqlite
 ├─ README.md
@@ -16,103 +27,125 @@ archive.qcearchive
    └─ files/
 ```
 
-- `manifest.json`：容器版本、生成器版本、会话信息和数量汇总。
-- `messages.sqlite`：未加密的标准 SQLite 3 数据库，UTF-8 编码，`PRAGMA user_version = 1`。
-- `README.md`：本文档的归档内副本。
-- `media/`：已成功下载的媒体。SQLite 中的路径都是相对于解压根目录的 `/` 分隔路径。
+v1 `manifest.json` 使用 `conversation` 描述唯一会话。`messages.sqlite` 的 `conversations` 表当前只有一行，但解析器不应依赖这一点。
 
-ZIP 条目名不允许作为目标绝对路径使用。解压时仍应防御 `..` 和绝对路径，并对总解压大小设上限。
+## v2：全账号归档
 
-## `manifest.json`
+```text
+account_123456_20260805_220000.qcearchive
+├─ manifest.json
+├─ messages.sqlite
+├─ README.md
+├─ source/
+│  └─ nt_msg.sqlite
+└─ resources/
+   └─ blobs/
+      └─ <sha256 前两位>/<sha256>.<扩展名>
+```
 
-当前 `schemaVersion` 为 `1`，`format` 固定为 `qcearchive`。解析器应当先检查主版本：未知的更高版本可以拒绝读取，但不应根据文件扩展名猜测结构。
+- `messages.sqlite`：规范化消息、关系状态、FTS5 索引和资源目录，是管理工具应优先读取的数据库。
+- `source/nt_msg.sqlite`：用户选定并已由 QCE 解密的源数据库副本。它用于保真存档，不是规范查询接口。
+- `resources/blobs/`：消息附件、头像、群文件、群相册和表情等资源的内容寻址存储；相同 SHA-256 只保存一次。
+- `README.md`：本说明的归档内副本。
 
-主要字段：
+`source/nt_msg.sqlite` 不包含 key，且 `sourceDatabase.encrypted` 固定为 `false`。直接提供仍加密的原始 NTQQ 数据库时，QCE 仍需先完成一次正确解密；这个限制与读取 `.qcearchive` 无关。
+
+## v2 manifest
+
+主要字段如下：
 
 | 字段 | 说明 |
 | --- | --- |
 | `format` | 固定为 `qcearchive` |
-| `schemaVersion` | 数据库和容器结构版本 |
+| `schemaVersion` | v2 固定为 `2` |
+| `archiveKind` | 固定为 `account` |
+| `archiveId` | 本次快照的唯一 ID |
 | `createdAt` | UTC ISO 8601 生成时间 |
-| `generator.name/version` | 生成器和 QCE 版本 |
-| `conversation` | `chatType`(1=私聊，2=群聊)、`peerUid`、`peerUin`、名称和头像 |
-| `counts` | 消息、参与者、资源引用、已封装媒体、缺失媒体数 |
-| `timeRange` | 首尾消息的 Unix 毫秒时间戳，无消息时为 `null` |
-| `database.path` | 固定为 `messages.sqlite` |
-| `media.root` | 固定为 `media/` |
+| `account` | 当前账号 UID、UIN、名称和头像 URL |
+| `sources` | 已导入 NTQQ 数据库与当前 NapCat 账号的数据源说明 |
+| `counts` | 会话、消息、资源、缺失资源、警告和分类数量 |
+| `timeRange` | 全账号首尾消息的 Unix 毫秒时间戳 |
+| `coverage` | 是否完整、警告数和缺失资源数；`complete=false` 时应提示用户 |
+| `database` | 规范库路径、版本和 FTS 信息 |
+| `sourceDatabase` | 源库路径、格式、字节数和 SHA-256 |
+| `resources` | Blob 根目录和哈希算法 |
 
-## SQLite 表
+## messages.sqlite 公共表
 
 ### `archive_meta`
 
-键值元数据，包含 `format`、`schema_version`、`created_at`、`generator_version`、`message_count`。值均为文本。
+键值元数据，包括格式、归档类型、版本、生成时间和数量统计。
+
+### `accounts`（v2）
+
+账号维表：`account_id`、`uid`、`uin`、`display_name`、`avatar_url`。
 
 ### `conversations`
 
-归档内会话。版本 1 的单次导出只写入一行，但解析器不应假定永远只有一行。
+v1 包含会话 ID、`chat_type`、UID/UIN、名称和头像。v2 增加：
 
-| 列 | 类型 | 说明 |
-| --- | --- | --- |
-| `conversation_id` | TEXT PK | 归档内稳定主键 |
-| `chat_type` | INTEGER | 1=私聊，2=群聊 |
-| `peer_uid` | TEXT | NTQQ 内部 UID，群聊时通常为群号 |
-| `peer_uin` | TEXT NULL | 私聊 QQ 号；未解析时为 NULL |
-| `display_name` | TEXT | 会话名称 |
-| `avatar_url` | TEXT NULL | 导出时的头像 URL |
+| 列 | 说明 |
+| --- | --- |
+| `account_id` | 所属 `accounts.account_id` |
+| `category` | `private`、`group` 或 `other` |
+| `relationship_status` | `friend`、`non_friend`、`group`、`unavailable_group` 或 `other` |
+| `source` | 会话数据来源，例如 `backup`、`live` 或 `merged` |
+
+`chat_type` 保存 NTQQ/NapCat 原始数值，不应只假定为 1 或 2。`conversation_aliases` 保存同一私聊的 UID/UIN 等匹配别名。
 
 ### `participants`
 
-发送者维表。`participant_id` 是归档内主键，业务匹配时应优先用 `uid`，并在可用时同时保留 `uin`。其余字段包含 `display_name`、`nickname`、`group_card`、`remark`、`title`和可选 `avatar_base64`。
+发送者维表。业务匹配优先使用 `uid`，同时保留可用的 `uin`、昵称、群名片、备注、头衔和可选 Base64 头像。
 
 ### `messages`
 
-| 列 | 类型 | 说明 |
-| --- | --- | --- |
-| `message_key` | TEXT PK | 归档内唯一键；不要猜测它等于 QQ 原始 ID |
-| `source_message_id` | TEXT | QQ/QCE 源消息 ID，可能重复 |
-| `conversation_id` | TEXT FK | 所属会话 |
-| `seq` | TEXT | QQ 消息序号，保留为文本避免整数溢出 |
-| `timestamp_ms` | INTEGER | Unix 毫秒时间戳 |
-| `time_text` | TEXT | QCE 生成的可读时间，仅用于展示 |
-| `sender_id` | TEXT FK | `participants.participant_id` |
-| `sender_name` | TEXT | 导出时展示名 |
-| `is_outgoing` | INTEGER | 1=当前登录账号发送，0=其他，NULL=无法判定 |
-| `message_type` | TEXT | QCE 规范化消息类型 |
-| `text_content` | TEXT | 用于列表和全文检索的文本 |
-| `recalled/system` | INTEGER | 0/1 标记 |
-| `content_json` | TEXT(JSON) | 规范化 `content`，其媒体路径已指向 `media/` |
-| `raw_json` | TEXT(JSON) NULL | QCE 解析时保留的源消息 |
-| `message_json` | TEXT(JSON) | 完整的 QCE `CleanMessage`，用于向前兼容 |
-
-常用索引：
-
-- `idx_messages_conversation_time (conversation_id, timestamp_ms, message_key)`
-- `idx_messages_sender_time (sender_id, timestamp_ms)`
-- `idx_messages_source_id (source_message_id)`
+| 列 | 说明 |
+| --- | --- |
+| `message_key` | 归档内唯一键；v2 会包含会话前缀 |
+| `source_message_id` | QQ/QCE 源消息 ID，可能重复 |
+| `conversation_id` | 所属会话 |
+| `seq` | QQ 消息序号，以文本保存 |
+| `timestamp_ms` | Unix 毫秒时间戳 |
+| `sender_id/sender_name` | 发送者引用与导出时展示名 |
+| `is_outgoing` | 1=当前账号发送，0=其他，NULL=无法判断 |
+| `message_type/text_content` | 规范消息类型与检索文本 |
+| `recalled/system` | 撤回与系统消息标记 |
+| `content_json` | 规范化内容和归档内资源路径 |
+| `raw_json` | 可选的源消息 JSON |
+| `message_json` | 完整 QCE `CleanMessage` 兼容载荷 |
 
 ### `message_elements`
 
-把顶层 `content.elements[]` 展开为行：`message_key`、`element_index`、`element_type`、`data_json`。嵌套合并转发的完整结构仍以 `messages.content_json` / `message_json` 为准。
+把顶层 `content.elements[]` 展开为行。合并转发等嵌套结构仍以 `content_json` / `message_json` 为准。
 
 ### `attachments`
 
-每个消息资源引用一行，并通过 `archive_path` 指向容器内文件。
+消息资源引用。v1 通过 `archive_path` 指向 `media/`；v2 同时以 `sha256` 引用 `resource_blobs`。`copied=0` 表示仅保留元数据，通常对应失效链接或无法访问的历史资源。
 
-- `message_key` 可为 NULL：这表示资源来自嵌套转发，只能通过 `source_message_id` 追溯。
-- `copied = 1` 表示文件已封装；`copied = 0` 表示仅保留元数据。
-- `sha256` 是已封装文件的小写十六进制 SHA-256，可用于校验和去重。
-- `source_url` 可能是过期的临时地址，解析器不应自动请求它。
+### `resource_blobs`（v2）
 
-### `message_search` (FTS5)
+内容寻址资源表：`sha256`、`archive_path`、`byte_size`、`mime_type`。读取资源前应校验路径边界，必要时校验 SHA-256。
 
-FTS5 虚拟表，字段为 `message_key`(不建索)、`conversation_name`、`sender_name`、`content`。使用 `trigram` tokenizer，便于中文和字符串片段检索。不足 3 个 Unicode 字符的关键字建议回退到 `LIKE`。
+### `extra_resources`（v2）
 
-## 查询示例
+账号级资源目录。`kind` 可表示头像、表情包、群文件、群相册等；`conversation_id`、`collection_id`、`logical_id` 和 `parent_id` 用于恢复群与目录层级，`metadata_json` 保存来源元数据。
 
-按最后消息时间查看会话：
+### `export_warnings`（v2）
+
+导出覆盖警告，包含 `scope`、`code`、`message` 和可选会话/资源 ID。管理工具应在 `coverage.complete=false` 时展示这些记录。
+
+### `message_search`
+
+FTS5 虚拟表，字段为 `message_key`（不索引）、`conversation_name`、`sender_name`、`content`，使用 `trigram` tokenizer。少于 3 个 Unicode 字符的关键词建议回退到 `instr` 或参数化 `LIKE`。
+
+## 常用查询
+
+账号快照中的会话列表：
 
 ```sql
 SELECT c.conversation_id,
+       c.category,
+       c.relationship_status,
        c.display_name,
        c.peer_uid,
        c.peer_uin,
@@ -124,21 +157,7 @@ GROUP BY c.conversation_id
 ORDER BY last_message_ms DESC;
 ```
 
-按 UID / QQ 号统计发言数：
-
-```sql
-SELECT p.uid,
-       p.uin,
-       p.display_name,
-       COUNT(*) AS message_count,
-       MAX(m.timestamp_ms) AS last_message_ms
-FROM messages AS m
-JOIN participants AS p ON p.participant_id = m.sender_id
-GROUP BY p.participant_id
-ORDER BY message_count DESC;
-```
-
-全文检索（绑定参数，不要拼接用户输入）：
+限定会话全文检索：
 
 ```sql
 SELECT m.message_key,
@@ -148,41 +167,50 @@ SELECT m.message_key,
 FROM message_search AS s
 JOIN messages AS m ON m.message_key = s.message_key
 WHERE message_search MATCH ?1
+  AND m.conversation_id = ?2
 ORDER BY m.timestamp_ms DESC
-LIMIT ?2 OFFSET ?3;
+LIMIT ?3 OFFSET ?4;
 ```
 
-短关键字回退：
+读取消息附件：
 
 ```sql
-SELECT message_key, timestamp_ms, sender_name, text_content
-FROM messages
-WHERE text_content LIKE '%' || ?1 || '%'
-ORDER BY timestamp_ms DESC
-LIMIT ?2 OFFSET ?3;
+SELECT a.resource_type,
+       a.file_name,
+       a.archive_path,
+       a.mime_type,
+       a.byte_size,
+       a.sha256
+FROM attachments AS a
+WHERE a.message_key = ?1 AND a.copied = 1
+ORDER BY a.resource_index;
 ```
 
-读取某条消息的媒体：
+读取群文件、相册或表情资源：
 
 ```sql
-SELECT resource_type, file_name, archive_path, mime_type, byte_size, sha256
-FROM attachments
-WHERE message_key = ?1 AND copied = 1
-ORDER BY resource_index;
+SELECT kind,
+       conversation_id,
+       collection_id,
+       logical_id,
+       parent_id,
+       display_name,
+       blob_sha256,
+       metadata_json
+FROM extra_resources
+WHERE kind = ?1
+ORDER BY conversation_id, collection_id, parent_id, display_name;
 ```
 
-## 解析建议
+## `.debug` 旁路目录
 
-1. 检查 ZIP 文件头和 `manifest.json`，不要只信任扩展名。
-2. 安全解压到独立临时目录；打开 SQLite 时使用只读 URI，例如 `file:messages.sqlite?mode=ro&immutable=1`。
-3. 先读 `PRAGMA user_version`，再按版本选择解析器。
-4. 列表展示优先读规范化列；需要完整消息语义时解析 `message_json`。
-5. 展示媒体前，把 `archive_path` 与解压根目录安全拼接并再次验证边界。
-6. 未知列应忽略；不应依赖 SQLite 列的物理顺序或 ZIP 条目顺序。
+启用调试导出时，会在归档旁生成同名 `<归档名>.debug/` 目录。它不是 `.qcearchive` 的必需部分，也不应重复导入为聊天消息。目录保存会话映射、原始/解析/最终 JSONL、资源调用事件、警告和完成/失败摘要，用于排查导出覆盖问题。
 
-## 兼容性约定
+## 安全与完整性
 
-- 同一 `schemaVersion` 内可能新增可选 manifest 字段、SQLite 列、表或索引；解析器应忽略未知内容。
-- 现有列的语义发生不兼容变化时，`schemaVersion` 会升级。
-- `message_json` 是保真兼容字段；其子字段可随 QCE 消息解析器演进，不应取代对 `schemaVersion` 的检查。
-- 归档中不包含 NTQQ 数据库密钥，`messages.sqlite` 也不是 NTQQ 原始数据库的镜像。
+1. 解压时拒绝绝对路径、`..` 和越出目标根目录的条目。
+2. 使用只读连接打开 `messages.sqlite`，例如 `Mode=ReadOnly` 或 `file:messages.sqlite?mode=ro&immutable=1`。
+3. 先读取 `PRAGMA user_version`，再选择 v1/v2 解析器。
+4. 资源按 manifest 指定的 `/` 分隔路径读取；不要自动请求归档中遗留的临时 `source_url`。
+5. 大归档可能使用 ZIP64；解析器和文件系统必须支持超过 4 GiB 的条目。
+6. 未知列和表应忽略；不要依赖 SQLite 行的物理顺序或 ZIP 条目顺序。

@@ -649,6 +649,87 @@ test.describe('Inactive sessions', () => {
     });
 });
 
+test.describe('Account archive exports', () => {
+    test('previews the selected backup and starts an optional debug account export', async ({ page }) => {
+        await clearLocalStorage(page);
+        await page.evaluate((value) => {
+            localStorage.setItem('qce_access_token', value);
+            localStorage.setItem('qce-onboarding-completed', 'true');
+        }, TOKEN);
+
+        const backup = {
+            id: 'account-backup-1',
+            fileName: 'nt_msg.sqlite',
+            format: 'nt_msg_export',
+            createdAt: '2026-08-05T12:00:00Z',
+            fileSize: 1024,
+            sessionCount: 88,
+            messageCount: 12345,
+        };
+        let previewBody: { backupImportId?: string } | undefined;
+        let createBody: { backupImportId?: string; debugExport?: boolean } | undefined;
+        await page.route('**/api/chat-backups', async (route, request) => {
+            if (request.method() !== 'GET') {
+                await route.continue();
+                return;
+            }
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({ success: true, data: { imports: [backup] } }),
+            });
+        });
+        await page.route('**/api/account-exports/preview', async (route, request) => {
+            previewBody = request.postDataJSON();
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({
+                    success: true,
+                    data: {
+                        account: { uid: 'u_self', uin: '123456789', name: '测试账号' },
+                        backup,
+                        counts: { total: 100, friend: 60, nonFriend: 20, group: 15, unavailableGroup: 4, other: 1 },
+                        historicalSessionCount: 88,
+                        currentFriendCount: 60,
+                        currentGroupCount: 15,
+                        localSessionCount: 80,
+                        warningCount: 0,
+                        warnings: [],
+                        fixedIncludes: ['messages.sqlite（规范化消息与 FTS5 索引）', 'source/nt_msg.sqlite（已解密源库副本）'],
+                        notice: '所选已解密备份将关联到当前登录账号。',
+                    },
+                }),
+            });
+        });
+        await page.route('**/api/account-exports', async (route, request) => {
+            createBody = request.postDataJSON();
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({ success: true, data: { taskId: 'account-export-test' } }),
+            });
+        });
+
+        const response = await page.goto(`${FRONTEND_BASE}${SHELL_PATH}`).catch(() => null);
+        test.skip(!response || response.status() >= 500, `frontend not reachable at ${FRONTEND_BASE}`);
+        await openSessionsTab(page);
+        await page.getByTestId('account-export-button').click();
+
+        const dialog = page.getByRole('dialog');
+        await expect(dialog.getByRole('heading', { name: '导出整个账号' })).toBeVisible();
+        await expect(dialog.locator('select')).toHaveValue(backup.id);
+        await expect(dialog.getByText(/历史主源：nt_msg\.sqlite/)).toBeVisible();
+        await expect.poll(() => previewBody).toEqual({ backupImportId: backup.id });
+        await expect(page.getByText('已删除/非好友', { exact: true })).toBeVisible();
+        await expect(page.getByText('已退出/不可用群', { exact: true })).toBeVisible();
+
+        await page.getByRole('checkbox').click();
+        await page.getByRole('button', { name: '创建全账号归档', exact: true }).click();
+        await expect.poll(() => createBody).toEqual({ backupImportId: backup.id, debugExport: true });
+    });
+});
+
 test.describe('Sticker exports', () => {
     test('exporting keeps the loaded sticker list visible', async ({ page }) => {
         await clearLocalStorage(page);
@@ -941,6 +1022,7 @@ test.describe('Standalone mode (issue #340)', () => {
         await expect(sessionsTab).toBeVisible({ timeout: 15_000 });
         await expect(page.getByRole('button', { name: '已删除/退出', exact: true })).toHaveCount(0);
         await sessionsTab.click();
+        await expect(page.getByTestId('account-export-button')).toHaveCount(0);
 
         // 引导卡片可见。
         const banner = page.getByTestId('sessions-standalone-banner');

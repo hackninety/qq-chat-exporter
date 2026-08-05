@@ -70,7 +70,7 @@ fn now_iso() -> String {
 }
 
 /// 获取相册列表（规范化为 `{albumId, albumName}`）。
-async fn fetch_album_list(state: &SharedState, group_code: &str) -> Vec<Value> {
+pub(crate) async fn fetch_album_list(state: &SharedState, group_code: &str) -> Vec<Value> {
     let Ok(result) = state.napcat.get_album_list(group_code).await else {
         return Vec::new();
     };
@@ -174,7 +174,11 @@ fn normalize_media_item(item: &Value) -> Value {
 }
 
 /// 分页获取相册媒体（attach_info 翻页直到结束）。
-async fn fetch_album_media(state: &SharedState, group_code: &str, album_id: &str) -> Vec<Value> {
+pub(crate) async fn fetch_album_media(
+    state: &SharedState,
+    group_code: &str,
+    album_id: &str,
+) -> Vec<Value> {
     let mut media_items = Vec::new();
     let mut attach_info = String::new();
     loop {

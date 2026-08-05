@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::time::Duration;
 
@@ -103,7 +103,7 @@ async fn fetch_file_list(
     folder_id: &str,
     start_index: i64,
     file_count: i64,
-) -> (Vec<Value>, Vec<Value>) {
+) -> (Vec<Value>, Vec<Value>, usize) {
     let params = json!({
         "sortType": 1,
         "fileCount": file_count,
@@ -113,10 +113,11 @@ async fn fetch_file_list(
         "folderId": folder_id,
     });
     let Ok(items) = state.napcat.get_group_file_list(group_code, &params).await else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), 0);
     };
     let empty: Vec<Value> = Vec::new();
     let items = items.as_array().unwrap_or(&empty);
+    let item_count = items.len();
 
     let parent = if folder_id.is_empty() { "/" } else { folder_id };
     let mut files = Vec::new();
@@ -148,31 +149,57 @@ async fn fetch_file_list(
             }));
         }
     }
-    (files, folders)
+    (files, folders, item_count)
 }
 
 /// 广度优先递归获取全部文件与文件夹。
-async fn fetch_all_files_recursive(
+pub(crate) async fn fetch_all_files_recursive(
     state: &SharedState,
     group_code: &str,
 ) -> (Vec<Value>, Vec<Value>) {
     let mut all_files = Vec::new();
     let mut all_folders = Vec::new();
     let mut queue: Vec<String> = vec![String::new()];
+    let mut seen_files = HashSet::new();
+    let mut seen_folders = HashSet::new();
+    const PAGE_SIZE: i64 = 100;
     while let Some(folder_id) = queue.pop() {
-        let (files, folders) = fetch_file_list(state, group_code, &folder_id, 0, 100).await;
-        all_files.extend(files);
-        for folder in folders {
-            queue.push(str_of(&folder, "folderId"));
-            all_folders.push(folder);
+        let mut start_index = 0_i64;
+        loop {
+            let previous_unique_count = all_files.len() + all_folders.len();
+            let (files, folders, item_count) =
+                fetch_file_list(state, group_code, &folder_id, start_index, PAGE_SIZE).await;
+            for file in files {
+                let file_id = str_of(&file, "fileId");
+                if !file_id.is_empty() && seen_files.insert(file_id) {
+                    all_files.push(file);
+                }
+            }
+            for folder in folders {
+                let child_id = str_of(&folder, "folderId");
+                if !child_id.is_empty() && seen_folders.insert(child_id.clone()) {
+                    queue.push(child_id);
+                    all_folders.push(folder);
+                }
+            }
+            if item_count < PAGE_SIZE as usize
+                || (start_index > 0 && all_files.len() + all_folders.len() == previous_unique_count)
+            {
+                break;
+            }
+            start_index = start_index.saturating_add(item_count as i64);
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
     (all_files, all_folders)
 }
 
 /// 获取群文件下载链接。
-async fn file_download_url(state: &SharedState, group_code: &str, file_id: &str) -> Option<String> {
+pub(crate) async fn file_download_url(
+    state: &SharedState,
+    group_code: &str,
+    file_id: &str,
+) -> Option<String> {
     let file_uuid = file_id.strip_prefix('/').unwrap_or(file_id);
     let result = state
         .napcat
@@ -213,7 +240,7 @@ pub async fn list_group_files(
         .and_then(|v| v.parse::<i64>().ok())
         .filter(|c| *c >= 1)
         .unwrap_or(100);
-    let (files, folders) =
+    let (files, folders, _) =
         fetch_file_list(&state, &group_code, &folder_id, start_index, file_count).await;
     response::success(
         json!({
@@ -452,7 +479,7 @@ pub async fn export_group_files_metadata(
 }
 
 /// 下载单个群文件到指定路径（通过下载链接）。
-async fn download_file_to(
+pub(crate) async fn download_file_to(
     state: &SharedState,
     group_code: &str,
     file_id: &str,
