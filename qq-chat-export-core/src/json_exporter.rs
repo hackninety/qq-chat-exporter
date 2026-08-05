@@ -1,4 +1,6 @@
-use crate::base::{ensure_parent_dir, file_size_or_zero, now_iso, preprocess_messages, ExporterContext};
+use crate::base::{
+    ensure_parent_dir, file_size_or_zero, now_iso, preprocess_messages, ExporterContext,
+};
 use crate::chunked_jsonl_writer::{
     ChunkedJsonlChunkInfo, ChunkedJsonlWriter, ChunkedJsonlWriterOptions,
 };
@@ -212,11 +214,17 @@ impl JsonExporter {
         match self.json_options.export_mode {
             JsonExportMode::ChunkedJsonl => {
                 let r = self
-                    .export_chunked_jsonl(messages, chat_info, self.json_options.chunked_jsonl.clone())
+                    .export_chunked_jsonl(
+                        messages,
+                        chat_info,
+                        self.json_options.chunked_jsonl.clone(),
+                    )
                     .await?;
                 Ok(r.base)
             }
-            JsonExportMode::SingleJson => self.export_single_json_streaming(messages, chat_info).await,
+            JsonExportMode::SingleJson => {
+                self.export_single_json_streaming(messages, chat_info).await
+            }
         }
     }
 
@@ -395,7 +403,9 @@ impl JsonExporter {
                 .await?;
         }
 
-        out_writer.write(&JsonSingleFileTemplates::end(&ctx)).await?;
+        out_writer
+            .write(&JsonSingleFileTemplates::end(&ctx))
+            .await?;
         out_writer.end().await?;
 
         // issue #277：拷贝资源到导出目录（失败不阻断导出）
@@ -542,8 +552,11 @@ impl JsonExporter {
                 .then(|| self.generate_export_options()),
         };
 
-        let manifest_content =
-            render_json_file(&manifest, self.json_options.pretty, self.json_options.indent)?;
+        let manifest_content = render_json_file(
+            &manifest,
+            self.json_options.pretty,
+            self.json_options.indent,
+        )?;
         tokio::fs::write(&manifest_path, manifest_content.as_bytes())
             .await
             .map_err(|e| ExportError::io("writeManifest", &manifest_path, e))?;
@@ -580,7 +593,10 @@ impl JsonExporter {
     /// 从 `output_path` 推导默认 chunked 输出目录：`<dirname>/<basename>_chunked_jsonl`。
     fn derive_default_chunked_output_dir(&self) -> PathBuf {
         let output_path = &self.ctx.options.output_path;
-        let dir = output_path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let dir = output_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         let base = output_path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -728,10 +744,7 @@ impl JsonExporter {
         } else {
             "image/jpeg"
         };
-        Some(format!(
-            "data:{mime_type};base64,{}",
-            BASE64.encode(&bytes)
-        ))
+        Some(format!("data:{mime_type};base64,{}", BASE64.encode(&bytes)))
     }
 }
 

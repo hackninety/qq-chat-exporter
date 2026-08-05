@@ -127,8 +127,9 @@ impl StatsAccumulator {
     pub fn finalize(self) -> FinalStats {
         let duration_days = match (self.start_ts, self.end_ts) {
             (Some(start), Some(end)) => {
-                let days =
-                    ((end - start) as f64 / f64::from(24 * 3600 * 1000)).round().max(1.0);
+                let days = ((end - start) as f64 / f64::from(24 * 3600 * 1000))
+                    .round()
+                    .max(1.0);
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 {
                     days as u64

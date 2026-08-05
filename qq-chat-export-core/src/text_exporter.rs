@@ -55,7 +55,11 @@ fn format_reply_time_label(ts: i64) -> String {
     if ts <= 0 {
         return String::new();
     }
-    let ms = if ts < 1_000_000_000_000 { ts * 1000 } else { ts };
+    let ms = if ts < 1_000_000_000_000 {
+        ts * 1000
+    } else {
+        ts
+    };
     let Some(d) = ms_to_local(ms) else {
         return String::new();
     };
@@ -120,11 +124,7 @@ impl TextExporter {
     }
 
     /// 生成文本内容。
-    fn generate_content(
-        &self,
-        messages: &[CleanMessage],
-        chat_info: &ChatInfo,
-    ) -> String {
+    fn generate_content(&self, messages: &[CleanMessage], chat_info: &ChatInfo) -> String {
         let mut lines: Vec<String> = Vec::new();
 
         lines.extend(self.generate_header(chat_info, messages));
@@ -260,10 +260,7 @@ impl TextExporter {
         }
 
         if self.text_options.show_resource_stats && !message.content.resources.is_empty() {
-            lines.push(format!(
-                "资源: {} 个文件",
-                message.content.resources.len()
-            ));
+            lines.push(format!("资源: {} 个文件", message.content.resources.len()));
             for resource in &message.content.resources {
                 lines.push(format!(
                     "  - {}: {}",
@@ -341,8 +338,7 @@ impl TextExporter {
             latest = Some(latest.map_or(ts, |l| l.max(ts)));
         }
         let (start, end) = (earliest?, latest?);
-        let start_time =
-            format_timestamp(ms_to_local(start)?, self.ctx.options.time_format);
+        let start_time = format_timestamp(ms_to_local(start)?, self.ctx.options.time_format);
         let end_time = format_timestamp(ms_to_local(end)?, self.ctx.options.time_format);
         Some(format!("{start_time} - {end_time}"))
     }

@@ -463,13 +463,15 @@ export function useExportTasks(_props?: UseExportTasksProps) {
       setLoading(true)
       setError(null)
 
-      const useStreamingMode = form.streamingZipMode === true
+      const useStreamingMode =
+        form.streamingZipMode === true && (form.format === "JSON" || form.format === "HTML")
       const isJsonFormat = form.format === "JSON"
 
       const requestBody: CreateTaskRequest = {
         peer: {
           chatType: form.chatType,
           peerUid: form.peerUid,
+          ...(form.backupImportId && { backupImportId: form.backupImportId }),
           ...(form.peerUin && { peerUin: form.peerUin }),
           guildId: "",
         },

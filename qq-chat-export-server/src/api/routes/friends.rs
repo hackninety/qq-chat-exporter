@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 use crate::api::response::{self, ApiError, ErrorType, RequestId};
 use crate::api::state::SharedState;
+use crate::backup_import::ImportedSession;
 
 /// 分页参数解析（page 默认 1、limit 默认 999）。
 fn page_and_limit(params: &HashMap<String, String>) -> (usize, usize) {
@@ -51,6 +52,19 @@ fn recent_contact_limit(params: &HashMap<String, String>) -> i64 {
         .map_or(100, |limit| limit.min(2_000))
 }
 
+fn inactive_session_limit(params: &HashMap<String, String>) -> i64 {
+    params
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|limit| *limit >= 1)
+        .map_or(2_000, |limit| limit.min(2_000))
+}
+
+struct LoadedRecentContacts {
+    contacts: Vec<Value>,
+    source: &'static str,
+}
+
 fn extract_recent_contacts(payload: &Value) -> Vec<Value> {
     payload
         .get("info")
@@ -82,6 +96,135 @@ fn merge_recent_contacts(lists: impl IntoIterator<Item = Vec<Value>>) -> Vec<Val
         }
     }
     merged
+}
+
+async fn load_recent_contacts(
+    state: &SharedState,
+    limit: i64,
+    include_all: bool,
+) -> Result<LoadedRecentContacts, ApiError> {
+    let snapshot = state
+        .napcat
+        .get_recent_contact_list_snapshot(limit)
+        .await
+        .map_err(|error| {
+            ApiError::new(ErrorType::Api, error.to_string(), "RECENT_CONTACTS_FAILED")
+        })?;
+    if snapshot
+        .get("info")
+        .and_then(|info| info.get("errCode"))
+        .and_then(Value::as_i64)
+        .is_some_and(|code| code != 0)
+    {
+        let message = snapshot
+            .get("info")
+            .and_then(|info| info.get("errMsg"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        return Err(ApiError::new(
+            ErrorType::Api,
+            format!("获取最近联系人失败: {message}"),
+            "RECENT_CONTACTS_FAILED",
+        ));
+    }
+
+    let mut lists = vec![extract_recent_contacts(&snapshot)];
+    let mut source = "snapshot";
+    if include_all {
+        let full_list = match tokio::time::timeout(
+            Duration::from_secs(5),
+            state.napcat.get_recent_contact_list_sync(),
+        )
+        .await
+        {
+            Ok(Ok(value)) => Some(value),
+            Ok(Err(error)) => {
+                tracing::debug!("getRecentContactListSync unavailable: {error}");
+                None
+            }
+            Err(_) => {
+                tracing::debug!("getRecentContactListSync timed out");
+                None
+            }
+        };
+        let full_list = if full_list.is_some() {
+            full_list
+        } else {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                state.napcat.get_recent_contact_list(),
+            )
+            .await
+            {
+                Ok(Ok(value)) => Some(value),
+                Ok(Err(error)) => {
+                    tracing::debug!("getRecentContactList unavailable: {error}");
+                    None
+                }
+                Err(_) => {
+                    tracing::debug!("getRecentContactList timed out");
+                    None
+                }
+            }
+        };
+        if let Some(value) = full_list {
+            lists.push(extract_recent_contacts(&value));
+            source = "full";
+        }
+    }
+
+    Ok(LoadedRecentContacts {
+        contacts: merge_recent_contacts(lists),
+        source,
+    })
+}
+
+fn list_payload<'a>(value: &'a Value, wrapper_keys: &[&str]) -> Option<&'a [Value]> {
+    value.as_array().map(Vec::as_slice).or_else(|| {
+        wrapper_keys
+            .iter()
+            .find_map(|key| value.get(*key).and_then(Value::as_array).map(Vec::as_slice))
+    })
+}
+
+fn friend_identifiers(friends: &Value) -> Option<HashSet<String>> {
+    let mut identifiers = HashSet::new();
+    for friend in list_payload(friends, &["friends", "data"])? {
+        let core = friend.get("coreInfo").unwrap_or(friend);
+        for key in ["uid", "uin"] {
+            let identifier = {
+                let nested = str_of(core, key);
+                if nested.is_empty() {
+                    str_of(friend, key)
+                } else {
+                    nested
+                }
+            };
+            if !identifier.is_empty() {
+                identifiers.insert(identifier);
+            }
+        }
+    }
+    Some(identifiers)
+}
+
+fn group_codes(groups: &Value) -> Option<HashSet<String>> {
+    Some(
+        list_payload(groups, &["groups", "data"])?
+            .iter()
+            .map(|group| str_of(group, "groupCode"))
+            .filter(|code| !code.is_empty())
+            .collect(),
+    )
+}
+
+fn inactive_membership_sets(
+    friends: &Value,
+    groups: &Value,
+) -> Result<(HashSet<String>, HashSet<String>), &'static str> {
+    let friend_ids = friend_identifiers(friends).ok_or("好友")?;
+    let active_group_codes = group_codes(groups).ok_or("群")?;
+    Ok((friend_ids, active_group_codes))
 }
 
 fn contact_classification(
@@ -182,6 +325,166 @@ fn map_recent_contact(
             include_all,
         ),
     }))
+}
+
+fn inactive_session_kind(
+    contact: &Value,
+    friend_ids: &HashSet<String>,
+    active_group_codes: &HashSet<String>,
+) -> Option<&'static str> {
+    let chat_type = int_of(contact, "chatType")?;
+    let peer_uid = str_of(contact, "peerUid");
+    if peer_uid.is_empty() {
+        return None;
+    }
+    match chat_type {
+        1 => {
+            let peer_uin = str_of(contact, "peerUin");
+            (!friend_ids.contains(&peer_uid)
+                && (peer_uin.is_empty() || !friend_ids.contains(&peer_uin)))
+            .then_some("non_friend")
+        }
+        2 => (!active_group_codes.contains(&peer_uid)).then_some("unavailable_group"),
+        _ => None,
+    }
+}
+
+fn build_inactive_sessions(
+    contacts: &[Value],
+    friend_ids: &HashSet<String>,
+    active_group_codes: &HashSet<String>,
+) -> Vec<Value> {
+    contacts
+        .iter()
+        .filter_map(|contact| {
+            let kind = inactive_session_kind(contact, friend_ids, active_group_codes)?;
+            let chat_type = int_of(contact, "chatType")?;
+            let peer_uid = str_of(contact, "peerUid");
+            let peer_uin = str_of(contact, "peerUin");
+            let raw_name = str_of(contact, "name");
+            let name = if raw_name.is_empty() || raw_name == peer_uid {
+                if chat_type == 2 {
+                    format!("群聊 {peer_uid}")
+                } else if peer_uin.is_empty() {
+                    peer_uid.clone()
+                } else {
+                    peer_uin.clone()
+                }
+            } else {
+                raw_name
+            };
+            let avatar_url = if chat_type == 2 {
+                format!("https://p.qlogo.cn/gh/{peer_uid}/{peer_uid}/640/")
+            } else {
+                str_of(contact, "avatarUrl")
+            };
+            let mut session = json!({
+                "kind": kind,
+                "chatType": chat_type,
+                "peerUid": peer_uid,
+                "name": name,
+                "avatarUrl": avatar_url,
+            });
+            let object = session.as_object_mut()?;
+            if !peer_uin.is_empty() {
+                object.insert("peerUin".to_string(), Value::String(peer_uin));
+            }
+            if let Some(last_msg_time) = contact.get("lastMsgTime").and_then(Value::as_str) {
+                object.insert(
+                    "lastMsgTime".to_string(),
+                    Value::String(last_msg_time.to_string()),
+                );
+            }
+            Some(session)
+        })
+        .collect()
+}
+
+fn imported_session_aliases(session: &ImportedSession) -> Vec<String> {
+    let mut aliases = vec![format!("{}|{}", session.chat_type, session.peer_uid)];
+    if let Some(peer_uin) = session.peer_uin.as_deref() {
+        if !peer_uin.is_empty() && peer_uin != session.peer_uid {
+            aliases.push(format!("{}|{peer_uin}", session.chat_type));
+        }
+    }
+    aliases
+}
+
+fn value_session_aliases(session: &Value) -> Vec<String> {
+    let Some(chat_type) = int_of(session, "chatType") else {
+        return Vec::new();
+    };
+    let peer_uid = str_of(session, "peerUid");
+    let peer_uin = str_of(session, "peerUin");
+    [peer_uid, peer_uin]
+        .into_iter()
+        .filter(|identifier| !identifier.is_empty())
+        .map(|identifier| format!("{chat_type}|{identifier}"))
+        .collect()
+}
+
+fn imported_inactive_session(
+    session: &ImportedSession,
+    friend_ids: &HashSet<String>,
+    active_group_codes: &HashSet<String>,
+) -> Option<Value> {
+    let peer_uin = session.peer_uin.as_deref().unwrap_or_default();
+    let kind = match session.chat_type {
+        1 if !friend_ids.contains(&session.peer_uid)
+            && (peer_uin.is_empty() || !friend_ids.contains(peer_uin)) =>
+        {
+            "non_friend"
+        }
+        2 if !active_group_codes.contains(&session.peer_uid)
+            && (peer_uin.is_empty() || !active_group_codes.contains(peer_uin)) =>
+        {
+            "unavailable_group"
+        }
+        _ => return None,
+    };
+    let mut value = json!({
+        "kind": kind,
+        "chatType": session.chat_type,
+        "peerUid": session.peer_uid,
+        "name": session.name,
+        "avatarUrl": session.avatar_url,
+        "backupImportId": session.import_id,
+        "sourceName": session.source_name,
+        "messageCount": session.message_count,
+    });
+    let object = value.as_object_mut()?;
+    if !peer_uin.is_empty() {
+        object.insert("peerUin".to_string(), Value::String(peer_uin.to_string()));
+    }
+    if let Some(last_msg_time) = session.last_msg_time.as_deref() {
+        object.insert(
+            "lastMsgTime".to_string(),
+            Value::String(last_msg_time.to_string()),
+        );
+    }
+    Some(value)
+}
+
+fn merge_imported_inactive_sessions(
+    sessions: &mut Vec<Value>,
+    imported: &[ImportedSession],
+    friend_ids: &HashSet<String>,
+    active_group_codes: &HashSet<String>,
+) {
+    let mut seen: HashSet<String> = sessions.iter().flat_map(value_session_aliases).collect();
+    for imported_session in imported {
+        let aliases = imported_session_aliases(imported_session);
+        if aliases.iter().any(|alias| seen.contains(alias)) {
+            continue;
+        }
+        let Some(session) =
+            imported_inactive_session(imported_session, friend_ids, active_group_codes)
+        else {
+            continue;
+        };
+        seen.extend(aliases);
+        sessions.push(session);
+    }
 }
 
 fn build_recent_contacts(
@@ -403,106 +706,19 @@ pub async fn recent_contacts(
     let limit = recent_contact_limit(&params);
     let include_all = params.get("includeAll").map(String::as_str) == Some("true");
 
-    let snapshot = match state.napcat.get_recent_contact_list_snapshot(limit).await {
-        Ok(value) => value,
-        Err(error) => {
-            let err = ApiError::new(ErrorType::Api, error.to_string(), "RECENT_CONTACTS_FAILED");
-            return response::error(&err, &request_id);
-        }
+    let loaded = match load_recent_contacts(&state, limit, include_all).await {
+        Ok(loaded) => loaded,
+        Err(error) => return response::error(&error, &request_id),
     };
-    if snapshot
-        .get("info")
-        .and_then(|info| info.get("errCode"))
-        .and_then(Value::as_i64)
-        .is_some_and(|code| code != 0)
-    {
-        let message = snapshot
-            .get("info")
-            .and_then(|info| info.get("errMsg"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let err = ApiError::new(
-            ErrorType::Api,
-            format!("获取最近联系人失败: {message}"),
-            "RECENT_CONTACTS_FAILED",
-        );
-        return response::error(&err, &request_id);
-    }
+    let raw_contacts = loaded.contacts;
 
-    let mut lists = vec![extract_recent_contacts(&snapshot)];
-    if include_all {
-        let full_list = match tokio::time::timeout(
-            Duration::from_secs(5),
-            state.napcat.get_recent_contact_list_sync(),
-        )
+    let friend_uids = state
+        .napcat
+        .get_friends(false)
         .await
-        {
-            Ok(Ok(value)) => Some(value),
-            Ok(Err(error)) => {
-                tracing::debug!("getRecentContactListSync unavailable: {error}");
-                None
-            }
-            Err(_) => {
-                tracing::debug!("getRecentContactListSync timed out");
-                None
-            }
-        };
-        let full_list = if full_list.is_some() {
-            full_list
-        } else {
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                state.napcat.get_recent_contact_list(),
-            )
-            .await
-            {
-                Ok(Ok(value)) => Some(value),
-                Ok(Err(error)) => {
-                    tracing::debug!("getRecentContactList unavailable: {error}");
-                    None
-                }
-                Err(_) => {
-                    tracing::debug!("getRecentContactList timed out");
-                    None
-                }
-            }
-        };
-        if let Some(value) = full_list {
-            lists.push(extract_recent_contacts(&value));
-        }
-    }
-    let raw_contacts = merge_recent_contacts(lists);
-
-    let mut friend_uids = HashSet::new();
-    if let Ok(friends) = state.napcat.get_friends(false).await {
-        if let Some(friend_list) = friends.as_array() {
-            for friend in friend_list {
-                let core = friend.get("coreInfo").unwrap_or(friend);
-                let uid = {
-                    let uid = str_of(core, "uid");
-                    if uid.is_empty() {
-                        str_of(friend, "uid")
-                    } else {
-                        uid
-                    }
-                };
-                if !uid.is_empty() {
-                    friend_uids.insert(uid);
-                }
-                let uin = {
-                    let uin = str_of(core, "uin");
-                    if uin.is_empty() {
-                        str_of(friend, "uin")
-                    } else {
-                        uin
-                    }
-                };
-                if !uin.is_empty() {
-                    friend_uids.insert(uin);
-                }
-            }
-        }
-    }
+        .ok()
+        .and_then(|friends| friend_identifiers(&friends))
+        .unwrap_or_default();
 
     let mut contacts = build_recent_contacts(&raw_contacts, &friend_uids, include_all);
     enrich_contact_names(&mut contacts, &state, include_all).await;
@@ -517,6 +733,108 @@ pub async fn recent_contacts(
     )
 }
 
+/// `GET /api/inactive-sessions` — 本机历史会话中已不在当前好友 / 群列表的会话。
+pub async fn inactive_sessions(
+    State(state): State<SharedState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let limit = inactive_session_limit(&params);
+    let loaded = match load_recent_contacts(&state, limit, true).await {
+        Ok(loaded) => loaded,
+        Err(error) => return response::error(&error, &request_id),
+    };
+
+    let (friends, groups) = tokio::join!(
+        state.napcat.get_friends(false),
+        state.napcat.get_groups(false),
+    );
+    let friends = match friends {
+        Ok(friends) => friends,
+        Err(error) => {
+            let err = ApiError::new(
+                ErrorType::Api,
+                format!("获取当前好友列表失败: {error}"),
+                "INACTIVE_SESSIONS_FAILED",
+            );
+            return response::error(&err, &request_id);
+        }
+    };
+    let groups = match groups {
+        Ok(groups) => groups,
+        Err(error) => {
+            let err = ApiError::new(
+                ErrorType::Api,
+                format!("获取当前群列表失败: {error}"),
+                "INACTIVE_SESSIONS_FAILED",
+            );
+            return response::error(&err, &request_id);
+        }
+    };
+
+    let (friend_ids, active_group_codes) = match inactive_membership_sets(&friends, &groups) {
+        Ok(sets) => sets,
+        Err(list_name) => {
+            let err = ApiError::new(
+                ErrorType::Api,
+                format!("当前{list_name}列表响应结构异常"),
+                "INACTIVE_SESSIONS_FAILED",
+            );
+            return response::error(&err, &request_id);
+        }
+    };
+    let raw_count = loaded.contacts.len();
+    let mut contacts: Vec<Value> = loaded
+        .contacts
+        .iter()
+        .filter_map(|contact| map_recent_contact(contact, &friend_ids, true))
+        .collect();
+    enrich_contact_names(&mut contacts, &state, true).await;
+    let mut sessions = build_inactive_sessions(&contacts, &friend_ids, &active_group_codes);
+    let imported_sessions = match state.backup_import_manager.list_sessions().await {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::warn!(
+                "failed to supplement inactive sessions from imported databases: {error}"
+            );
+            Vec::new()
+        }
+    };
+    let database_raw_count = imported_sessions.len();
+    merge_imported_inactive_sessions(
+        &mut sessions,
+        &imported_sessions,
+        &friend_ids,
+        &active_group_codes,
+    );
+    sessions.sort_by(|left, right| {
+        str_of(right, "lastMsgTime")
+            .cmp(&str_of(left, "lastMsgTime"))
+            .then_with(|| str_of(left, "name").cmp(&str_of(right, "name")))
+    });
+    sessions.truncate(limit as usize);
+    let non_friend_count = sessions
+        .iter()
+        .filter(|session| session.get("kind").and_then(Value::as_str) == Some("non_friend"))
+        .count();
+    let total_count = sessions.len();
+    let unavailable_group_count = total_count.saturating_sub(non_friend_count);
+
+    response::success(
+        json!({
+            "sessions": sessions,
+            "totalCount": total_count,
+            "nonFriendCount": non_friend_count,
+            "unavailableGroupCount": unavailable_group_count,
+            "rawCount": raw_count,
+            "databaseRawCount": database_raw_count,
+            "indexSource": loaded.source,
+            "source": if database_raw_count > 0 { "database" } else { loaded.source },
+        }),
+        &request_id,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +842,7 @@ mod tests {
     #[test]
     fn limits_snapshot_count_without_rejecting_valid_values() {
         assert_eq!(recent_contact_limit(&HashMap::new()), 100);
+        assert_eq!(inactive_session_limit(&HashMap::new()), 2_000);
         assert_eq!(
             recent_contact_limit(&HashMap::from([("limit".to_string(), "500".to_string())])),
             500
@@ -531,6 +850,10 @@ mod tests {
         assert_eq!(
             recent_contact_limit(&HashMap::from([("limit".to_string(), "9000".to_string())])),
             2_000
+        );
+        assert_eq!(
+            inactive_session_limit(&HashMap::from([("limit".to_string(), "50".to_string())])),
+            50
         );
     }
 
@@ -586,6 +909,151 @@ mod tests {
         .unwrap();
         assert_eq!(friend["classification"], "friend");
         assert_eq!(non_friend["classification"], "special");
+    }
+
+    #[test]
+    fn friend_identifiers_support_nested_and_flat_payloads() {
+        let identifiers = friend_identifiers(&json!([
+            {"coreInfo": {"uid": "u_nested", "uin": "10001"}},
+            {"uid": "u_flat", "uin": 10002}
+        ]))
+        .expect("array payload should be accepted");
+        assert_eq!(identifiers.len(), 4);
+        for expected in ["u_nested", "10001", "u_flat", "10002"] {
+            assert!(identifiers.contains(expected));
+        }
+
+        let wrapped = friend_identifiers(&json!({
+            "friends": [{"uid": "u_wrapped", "uin": "10003"}]
+        }))
+        .expect("wrapped payload should be accepted");
+        assert!(wrapped.contains("u_wrapped"));
+        assert!(wrapped.contains("10003"));
+    }
+
+    #[test]
+    fn inactive_membership_requires_both_current_lists() {
+        let contacts = [json!({
+            "chatType": 1,
+            "peerUid": "u_active",
+            "peerUin": "10001",
+            "name": "当前好友"
+        })];
+
+        assert!(inactive_membership_sets(&Value::Null, &json!([])).is_err());
+        assert!(inactive_membership_sets(&json!([]), &json!({"unexpected": []})).is_err());
+
+        let (friend_ids, active_group_codes) = inactive_membership_sets(
+            &json!({"data": [{"uid": "u_active", "uin": "10001"}]}),
+            &json!({"groups": []}),
+        )
+        .expect("supported wrappers should be accepted");
+        assert!(build_inactive_sessions(&contacts, &friend_ids, &active_group_codes).is_empty());
+    }
+
+    #[test]
+    fn inactive_sessions_exclude_active_peers_and_unrelated_chat_types() {
+        let friend_ids = HashSet::from([
+            "u_active".to_string(),
+            "10001".to_string(),
+            "10002".to_string(),
+        ]);
+        let active_group_codes = HashSet::from(["20001".to_string()]);
+        let raw_contacts = [
+            json!({"chatType": 1, "peerUid": "u_active", "peerUin": "10001"}),
+            json!({"chatType": 1, "peerUid": "u_changed", "peerUin": "10002"}),
+            json!({
+                "chatType": 1,
+                "peerUid": "u_removed",
+                "peerUin": "10003",
+                "peerName": "旧好友",
+                "msgTime": 1_783_950_000
+            }),
+            json!({"chatType": 2, "peerUid": "20001", "peerName": "当前群"}),
+            json!({"chatType": 2, "peerUid": "20002"}),
+            json!({"chatType": 118, "peerUid": "u_service", "peerName": "服务号"}),
+        ];
+        let contacts: Vec<Value> = raw_contacts
+            .iter()
+            .filter_map(|contact| map_recent_contact(contact, &friend_ids, true))
+            .collect();
+        let sessions = build_inactive_sessions(&contacts, &friend_ids, &active_group_codes);
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["kind"], "non_friend");
+        assert_eq!(sessions[0]["name"], "旧好友");
+        assert_eq!(sessions[0]["peerUin"], "10003");
+        assert_eq!(sessions[0]["lastMsgTime"], "2026-07-13T13:40:00.000Z");
+        assert_eq!(sessions[1]["kind"], "unavailable_group");
+        assert_eq!(sessions[1]["name"], "群聊 20002");
+        assert_eq!(
+            sessions[1]["avatarUrl"],
+            "https://p.qlogo.cn/gh/20002/20002/640/"
+        );
+    }
+
+    #[test]
+    fn imported_message_tables_supplement_the_recent_contact_index() {
+        let friend_ids = HashSet::from(["u_active".to_string(), "10001".to_string()]);
+        let active_group_codes = HashSet::from(["20001".to_string()]);
+        let mut sessions = vec![json!({
+            "kind": "non_friend",
+            "chatType": 1,
+            "peerUid": "u_recent_removed",
+            "peerUin": "10002",
+            "name": "最近索引中的旧好友"
+        })];
+        let imported = vec![
+            ImportedSession {
+                import_id: "backup-1".to_string(),
+                source_name: "nt_msg.db".to_string(),
+                format: "nt_msg_raw".to_string(),
+                chat_type: 1,
+                peer_uid: "u_active".to_string(),
+                peer_uin: Some("10001".to_string()),
+                name: "QQ 10001".to_string(),
+                avatar_url: String::new(),
+                last_msg_time: None,
+                message_count: 10,
+            },
+            ImportedSession {
+                import_id: "backup-1".to_string(),
+                source_name: "nt_msg.db".to_string(),
+                format: "nt_msg_raw".to_string(),
+                chat_type: 1,
+                peer_uid: "u_historical_removed".to_string(),
+                peer_uin: Some("10003".to_string()),
+                name: "QQ 10003".to_string(),
+                avatar_url: "private-avatar".to_string(),
+                last_msg_time: Some("2014-01-02T00:00:00Z".to_string()),
+                message_count: 200,
+            },
+            ImportedSession {
+                import_id: "backup-1".to_string(),
+                source_name: "nt_msg.db".to_string(),
+                format: "nt_msg_raw".to_string(),
+                chat_type: 2,
+                peer_uid: "20002".to_string(),
+                peer_uin: Some("20002".to_string()),
+                name: "群聊 20002".to_string(),
+                avatar_url: "group-avatar".to_string(),
+                last_msg_time: Some("2020-01-02T00:00:00Z".to_string()),
+                message_count: 300,
+            },
+        ];
+
+        merge_imported_inactive_sessions(
+            &mut sessions,
+            &imported,
+            &friend_ids,
+            &active_group_codes,
+        );
+
+        assert_eq!(sessions.len(), 3, "active friends must remain excluded");
+        assert_eq!(sessions[1]["backupImportId"], "backup-1");
+        assert_eq!(sessions[1]["kind"], "non_friend");
+        assert_eq!(sessions[1]["messageCount"], 200);
+        assert_eq!(sessions[2]["kind"], "unavailable_group");
     }
 
     #[test]

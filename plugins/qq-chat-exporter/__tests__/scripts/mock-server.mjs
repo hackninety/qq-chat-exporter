@@ -141,7 +141,9 @@ function pickScenario(scenario, fixtures) {
                 fixtures.privateWithRecall(),
                 fixtures.privateWithForward(),
                 fixtures.privateVolume(50),
-                fixtures.privateDeactivatedFriend()
+                fixtures.privateDeactivatedFriend(),
+                fixtures.indexedNonFriendConversation(),
+                fixtures.unavailableGroupConversation()
             ];
     }
 }

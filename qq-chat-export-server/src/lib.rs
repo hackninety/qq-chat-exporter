@@ -1,4 +1,5 @@
 pub mod api;
+pub mod backup_import;
 pub mod export_debug;
 pub mod fetcher;
 pub mod market_face;

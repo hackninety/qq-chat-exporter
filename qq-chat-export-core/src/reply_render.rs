@@ -78,15 +78,17 @@ pub fn reply_timestamp_millis(value: Option<&Value>) -> Option<i64> {
             if value.is_empty() {
                 None
             } else if value.chars().all(|character| character.is_ascii_digit()) {
-                value.parse::<i64>().ok().filter(|number| *number > 0).map(
-                    |number| {
+                value
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|number| *number > 0)
+                    .map(|number| {
                         if number > 1_000_000_000_000 {
                             number
                         } else {
                             number * 1000
                         }
-                    },
-                )
+                    })
             } else {
                 DateTime::parse_from_rfc3339(value)
                     .map(|date| date.timestamp_millis())
@@ -124,7 +126,6 @@ pub fn format_reply_timestamp(value: Option<&Value>) -> String {
 /// 合成跳转目标与时间标签。
 #[must_use]
 pub fn pick_reply_render_hints(data: &ReplyRenderInput) -> (Option<String>, String) {
-    let formatted_time =
-        format_reply_timestamp(data.timestamp.as_ref().or(data.time.as_ref()));
+    let formatted_time = format_reply_timestamp(data.timestamp.as_ref().or(data.time.as_ref()));
     (choose_reply_jump_target(data), formatted_time)
 }

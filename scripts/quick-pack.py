@@ -516,8 +516,12 @@ if %errorLevel% == 0 (
     echo Administrator mode detected.
 ) else (
     echo Please run this script in administrator mode.
-    powershell -Command "Start-Process 'wt.exe' -ArgumentList 'cmd /c cd /d \\"%~dp0\\" && \\"%~f0\\" %*' -Verb runAs"
-    exit
+    set "QCE_ELEVATE_SCRIPT=%~f0"
+    set "QCE_ELEVATE_WORKDIR=%~dp0"
+    set "QCE_ELEVATE_ARGS=%*"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$terminal = Get-Command wt.exe -ErrorAction SilentlyContinue; if ($terminal) { $quote = [char]34; $terminalArgs = '-w new cmd.exe /d /c call ' + $quote + $env:QCE_ELEVATE_SCRIPT + $quote; if ($env:QCE_ELEVATE_ARGS) { $terminalArgs += ' ' + $env:QCE_ELEVATE_ARGS }; Start-Process -FilePath $terminal.Source -ArgumentList $terminalArgs -Verb RunAs } else { $params = @{ FilePath = $env:QCE_ELEVATE_SCRIPT; WorkingDirectory = $env:QCE_ELEVATE_WORKDIR; Verb = 'RunAs' }; if ($env:QCE_ELEVATE_ARGS) { $params.ArgumentList = $env:QCE_ELEVATE_ARGS }; Start-Process @params }"
+    if errorlevel 1 exit /b 1
+    exit /b 0
 )
 
 cd /d "%~dp0"
@@ -540,8 +544,12 @@ if %errorLevel% == 0 (
     echo Administrator mode detected.
 ) else (
     echo Please run this script in administrator mode.
-    powershell -Command "Start-Process 'cmd.exe' -ArgumentList '/c cd /d \\"%~dp0\\" && \\"%~f0\\" %*' -Verb runAs"
-    exit
+    set "QCE_ELEVATE_SCRIPT=%~f0"
+    set "QCE_ELEVATE_WORKDIR=%~dp0"
+    set "QCE_ELEVATE_ARGS=%*"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$params = @{ FilePath = $env:QCE_ELEVATE_SCRIPT; WorkingDirectory = $env:QCE_ELEVATE_WORKDIR; Verb = 'RunAs' }; if ($env:QCE_ELEVATE_ARGS) { $params.ArgumentList = $env:QCE_ELEVATE_ARGS }; Start-Process @params"
+    if errorlevel 1 exit /b 1
+    exit /b 0
 )
 
 cd /d "%~dp0"

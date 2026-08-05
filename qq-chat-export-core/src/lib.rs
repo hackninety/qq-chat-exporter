@@ -8,6 +8,7 @@ pub mod json_exporter;
 pub mod json_templates;
 pub mod modern_html_exporter;
 pub mod modern_html_templates;
+pub mod qce_archive_exporter;
 pub mod reply_preview_renderer;
 pub mod reply_render;
 pub mod stats;

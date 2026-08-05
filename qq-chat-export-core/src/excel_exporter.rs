@@ -112,8 +112,8 @@ pub fn calculate_statistics(messages: &[CleanMessage]) -> MessageStatistics {
         stats.time_range_start = ms_to_iso(*first);
         stats.time_range_end = ms_to_iso(*last);
         let diff = last - first;
-        stats.duration_days = diff.div_euclid(86_400_000)
-            + i64::from(diff.rem_euclid(86_400_000) > 0);
+        stats.duration_days =
+            diff.div_euclid(86_400_000) + i64::from(diff.rem_euclid(86_400_000) > 0);
     }
 
     for m in messages {
@@ -302,12 +302,13 @@ impl ExcelExporter {
         sheet.set_name("统计信息")?;
 
         let mut row: u32 = 0;
-        let kv_str = |sheet: &mut Worksheet, row: &mut u32, k: &str, v: &str| -> ExportResultT<()> {
-            sheet.write_string(*row, 0, k)?;
-            sheet.write_string(*row, 1, v)?;
-            *row += 1;
-            Ok(())
-        };
+        let kv_str =
+            |sheet: &mut Worksheet, row: &mut u32, k: &str, v: &str| -> ExportResultT<()> {
+                sheet.write_string(*row, 0, k)?;
+                sheet.write_string(*row, 1, v)?;
+                *row += 1;
+                Ok(())
+            };
         let kv_num = |sheet: &mut Worksheet, row: &mut u32, k: &str, v: f64| -> ExportResultT<()> {
             sheet.write_string(*row, 0, k)?;
             sheet.write_number(*row, 1, v)?;

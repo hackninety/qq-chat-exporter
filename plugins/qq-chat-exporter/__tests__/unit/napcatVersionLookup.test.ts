@@ -75,3 +75,11 @@ test('one release-wide lookup feeds every packaging job', () => {
     // Honouring the pinned value is what makes the fan-out work at all.
     assert.ok(read('scripts/plugin_runtime.py').includes('os.environ.get("NAPCAT_VERSION"'));
 });
+
+test('a rate-limited local lookup resolves the official latest-release redirect', () => {
+    const source = read('scripts/plugin_runtime.py');
+
+    assert.ok(source.includes('https://github.com/NapNeko/NapCatQQ/releases/latest'));
+    assert.ok(source.includes('_get_napcat_latest_version_from_page()'));
+    assert.match(source, /error\.code in \(403, 429\)/);
+});

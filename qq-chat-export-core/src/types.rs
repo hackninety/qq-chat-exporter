@@ -19,6 +19,8 @@ pub enum ExportFormat {
     Excel,
     /// 现代化 HTML 导出（单文件 / chunked viewer）。
     ModernHtml,
+    /// QCE Archive（SQLite + 媒体 + 自描述文档）。
+    QceArchive,
 }
 
 impl std::fmt::Display for ExportFormat {
@@ -29,6 +31,7 @@ impl std::fmt::Display for ExportFormat {
             Self::Html => "HTML",
             Self::Excel => "EXCEL",
             Self::ModernHtml => "MODERN_HTML",
+            Self::QceArchive => "QCEARCHIVE",
         };
         f.write_str(s)
     }

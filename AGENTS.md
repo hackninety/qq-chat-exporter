@@ -212,6 +212,14 @@ Also inspect changed lockfiles and generated assets. Do not commit `.next/`,
 
 ## 7. Git and review discipline
 
+### Default development branch
+
+- `dev` is the default integration branch for ongoing development. Unless the developer explicitly says otherwise, switch to `dev` before editing, commit there, and push to the fork's `dev` branch. Never push development commits to the upstream repository.
+- Commit subjects and bodies must be written in Chinese while retaining the repository's conventional prefix, for example `feat: 添加聊天备份导入` or `fix: 修复归档路径校验`.
+- Do not push development work directly to `master`/`main`. Merge `dev` into the fork's default branch only through a pull request after every required local check for the touched areas and all required CI checks pass.
+- Before every `dev` → `master`/`main` merge, fetch the authoritative upstream default branch, merge its latest commit into `dev`, resolve any conflicts on `dev`, and rerun the complete required checks. Prove the upstream tip is an ancestor of the tested `dev` commit before allowing the merge.
+- If upstream synchronization or any required test is incomplete or failing, keep the work on `dev` and do not merge it into `master`/`main`.
+
 - Branch from the actual intended base and fetch tags before release work.
 - Never push directly to `master`/`main`.
 - Keep commits focused and use the repository's conventional prefixes (`feat:`, `fix:`, `perf:`, `docs:`, `test:`, `chore:`).

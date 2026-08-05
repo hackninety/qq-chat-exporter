@@ -150,6 +150,11 @@ impl PathManager {
         self.default_base_dir().join("database")
     }
 
+    /// 聊天记录备份导入目录。原文件永不在原地修改；QCE 只在此目录保存自己的副本。
+    pub fn backup_imports_dir(&self) -> PathBuf {
+        self.default_base_dir().join("backup-imports")
+    }
+
     /// 头像目录。
     pub fn avatars_dir(&self) -> PathBuf {
         self.exports_dir().join("avatars")
@@ -162,6 +167,7 @@ impl PathManager {
             self.scheduled_exports_dir(),
             self.resources_dir(),
             self.database_dir(),
+            self.backup_imports_dir(),
         ] {
             tokio::fs::create_dir_all(&dir).await?;
         }

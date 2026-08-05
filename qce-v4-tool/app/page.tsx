@@ -9,6 +9,8 @@ import { toast } from "@/components/ui/toast"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import type { BatchExportItem, BatchExportConfig } from "@/components/ui/batch-export-dialog"
 import { SessionList } from "@/components/ui/session-list"
+import { InactiveSessionList } from "@/components/ui/inactive-session-list"
+import { ChatBackupImportSection } from "@/components/ui/chat-backup-import"
 import { BatchSelectionCheckbox } from "@/components/ui/batch-selection-checkbox"
 import { ExportHelpDialog, type ExportHelpFormat } from "@/components/ui/export-help-dialog"
 import {
@@ -54,6 +56,7 @@ import {
   MessageCircle,
   Users,
   User,
+  UserMinus,
   CalendarDays,
   FileText,
   Clock,
@@ -83,7 +86,7 @@ import {
   Search,
   Square,
 } from "lucide-react"
-import type { CreateTaskForm, CreateScheduledExportForm } from "@/types/api"
+import type { CreateTaskForm, CreateScheduledExportForm, InactiveSession } from "@/types/api"
 import { useQCE } from "@/hooks/use-qce"
 import { BUILD_VERSION, isNewerVersion, isMajorUpdate, extractReleaseImage } from "@/lib/version"
 import { UpdatePopover, type UpdateBannerInfo } from "@/components/ui/update-banner"
@@ -99,6 +102,8 @@ import {
 import { useChatHistory } from "@/hooks/use-chat-history"
 import { useStickerPacks } from "@/hooks/use-sticker-packs"
 import { useResourceIndex } from "@/hooks/use-resource-index"
+import { useInactiveSessions } from "@/hooks/use-inactive-sessions"
+import { useChatBackups } from "@/hooks/use-chat-backups"
 
 import { ThemeToggle } from "@/components/qce-dashboard/theme-toggle"
 import { Loader } from "@/components/ui/loader"
@@ -129,6 +134,9 @@ function TaskFormatLabel({ format, className }: { format: string; className?: st
       </span>
     )
   }
+  if (format === "QCEARCHIVE") {
+    return <span className={className}>QCE Archive</span>
+  }
   return <span className={className}>{format}</span>
 }
 
@@ -154,13 +162,14 @@ const INLINE_DIVIDER = (
   <span aria-hidden className="mx-0.5 inline-block h-3 w-px translate-y-[2px] bg-current opacity-20" />
 )
 
-const VALID_TABS = ["overview", "sessions", "tasks", "scheduled", "history", "stickers", "settings", "about"] as const
+const VALID_TABS = ["overview", "sessions", "inactive", "tasks", "scheduled", "history", "stickers", "settings", "about"] as const
 type TabId = typeof VALID_TABS[number]
 
 const TAB_PATH_MAP: Record<string, TabId> = {
   "": "overview",
   "overview": "overview",
   "sessions": "sessions",
+  "inactive": "inactive",
   "tasks": "tasks",
   "scheduled": "scheduled",
   "history": "history",
@@ -196,7 +205,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
     type: 'group' | 'friend',
     id: string,
     name: string,
-    peer: { chatType: number, peerUid: string }
+    peer: { chatType: number, peerUid: string, backupImportId?: string }
   } | null>(null)
   const [isFilePathModalOpen, setIsFilePathModalOpen] = useState(false)
   const [selectedFile, setSelectedFile] = useState<{ filePath: string; sessionName: string; fileName: string; size?: number } | null>(null)
@@ -213,6 +222,24 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
   const [batchMode, setBatchMode] = useState(false)
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set())
   const [isBatchExportDialogOpen, setIsBatchExportDialogOpen] = useState(false)
+
+  const {
+    data: inactiveSessionsData,
+    loading: inactiveSessionsLoading,
+    error: inactiveSessionsError,
+    loadInactiveSessions,
+  } = useInactiveSessions()
+  const {
+    imports: chatBackupImports,
+    loading: chatBackupsLoading,
+    importing: chatBackupImporting,
+    detectingKey: chatBackupDetectingKey,
+    error: chatBackupsError,
+    loaded: chatBackupsLoaded,
+    loadBackups: loadChatBackups,
+    detectKey: detectChatBackupKey,
+    importFile: importChatBackupFile,
+  } = useChatBackups()
   
   // 定时备份合并状态
   const [isScheduledMergeDialogOpen, setIsScheduledMergeDialogOpen] = useState(false)
@@ -223,7 +250,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
   
   // 聊天记录筛选状态
   const [historyFilter, setHistoryFilter] = useState<'all' | 'group' | 'friend'>('all')
-  const [historyFormatFilter, setHistoryFormatFilter] = useState<'all' | 'html' | 'json' | 'zip' | 'jsonl'>('all')
+  const [historyFormatFilter, setHistoryFormatFilter] = useState<'all' | 'html' | 'json' | 'zip' | 'jsonl' | 'qcearchive'>('all')
   const [historyViewMode, setHistoryViewMode] = useState<'list' | 'gallery'>('list')
   const [previewResource, setPreviewResource] = useState<{ type: string; url: string; name: string } | null>(null)
   
@@ -681,11 +708,44 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
     type: 'group' | 'friend',
     id: string,
     name: string,
-    peer: { chatType: number, peerUid: string }
+    peer: { chatType: number, peerUid: string, backupImportId?: string }
   ) => {
     setPreviewingChat({ type, id, name, peer })
     setIsPreviewModalOpen(true)
   }, [])
+
+  const handlePreviewInactiveSession = useCallback((session: InactiveSession) => {
+    handlePreviewChat(
+      session.kind === 'unavailable_group' ? 'group' : 'friend',
+      session.peerUid,
+      session.name,
+      {
+        chatType: session.chatType,
+        peerUid: session.peerUid,
+        backupImportId: session.backupImportId,
+      },
+    )
+  }, [handlePreviewChat])
+
+  const handleExportInactiveSession = useCallback((session: InactiveSession) => {
+    handleOpenTaskWizard({
+      chatType: session.chatType,
+      peerUid: session.peerUid,
+      peerUin: session.kind === 'unavailable_group'
+        ? (session.peerUin || session.peerUid)
+        : session.peerUin,
+      backupImportId: session.backupImportId,
+      sessionName: session.name,
+      format: "QCEARCHIVE",
+      filterPureImageMessages: false,
+    })
+  }, [handleOpenTaskWizard])
+
+  const handleImportChatBackupFile = useCallback(async (file: File, key?: string) => {
+    const imported = await importChatBackupFile(file, key)
+    if (imported) await loadInactiveSessions()
+    return imported
+  }, [importChatBackupFile, loadInactiveSessions])
 
   const handleCloseTaskWizard = () => {
     setIsTaskWizardOpen(false)
@@ -1277,6 +1337,16 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
   }, [activeTab, groups.length, friends.length, loadChatData, isStandalone])
 
   useEffect(() => {
+    if (!systemInfo || isStandalone || activeTab !== "inactive" || inactiveSessionsData) return
+    loadInactiveSessions()
+  }, [activeTab, inactiveSessionsData, isStandalone, loadInactiveSessions, systemInfo])
+
+  useEffect(() => {
+    if (!systemInfo || isStandalone || activeTab !== "inactive" || chatBackupsLoaded) return
+    loadChatBackups()
+  }, [activeTab, chatBackupsLoaded, isStandalone, loadChatBackups, systemInfo])
+
+  useEffect(() => {
     if (!error) return
     // Issue #340：独立模式下 friends/groups 必然失败，错误文案里通常带
     // 「独立模式」或后端的 `STANDALONE_MODE` code，统一吞掉，避免连续弹两次
@@ -1440,6 +1510,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
   const navItems = [
     { id: "overview", label: "概览", icon: Activity },
     { id: "sessions", label: "会话", icon: MessageCircle },
+    ...(!isStandalone ? [{ id: "inactive", label: "已删除/退出", icon: UserMinus }] : []),
     { id: "tasks", label: "任务", icon: Zap },
     { id: "scheduled", label: "定时导出", icon: Clock },
     { id: "history", label: "聊天记录", icon: History },
@@ -1455,6 +1526,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
   const pageTitles: Record<string, string> = {
     overview: "概览",
     sessions: "会话",
+    inactive: "已删除/退出",
     tasks: "任务",
     scheduled: "定时导出",
     history: "聊天记录",
@@ -2045,6 +2117,56 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
               </div>
             )}
 
+            {/* ==================== INACTIVE SESSIONS ==================== */}
+            {activeTab === "inactive" && (
+              <div className="px-4 pt-2 pb-5">
+                {isStandalone ? (
+                  <div className="rounded-xl bg-card p-6 space-y-4">
+                    <div className="flex items-start gap-3">
+                      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
+                        <Database className="h-[18px] w-[18px]" />
+                      </div>
+                      <div className="min-w-0 space-y-1.5">
+                        <h3 className="text-[15px] font-semibold text-foreground">完整模式下才能读取这些会话</h3>
+                        <p className="text-[13px] leading-relaxed text-muted-foreground/80">
+                          独立模式没有 NapCat 和 QQ 登录态，无法比较当前好友、群列表与本机历史会话。
+                        </p>
+                      </div>
+                    </div>
+                    <Button
+                      size="sm"
+                      className="h-8 rounded-full px-3 text-[13px]"
+                      onClick={() => setActiveTab("history")}
+                    >
+                      浏览已导出的聊天记录
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="space-y-8">
+                    <InactiveSessionList
+                      data={inactiveSessionsData}
+                      loading={inactiveSessionsLoading}
+                      error={inactiveSessionsError}
+                      onRefresh={loadInactiveSessions}
+                      onPreview={handlePreviewInactiveSession}
+                      onExport={handleExportInactiveSession}
+                      onManualLookup={() => handleOpenTaskWizard()}
+                    />
+                    <ChatBackupImportSection
+                      imports={chatBackupImports}
+                      loading={chatBackupsLoading}
+                      importing={chatBackupImporting}
+                      detectingKey={chatBackupDetectingKey}
+                      error={chatBackupsError}
+                      onRefresh={loadChatBackups}
+                      onDetectKey={detectChatBackupKey}
+                      onImportFile={handleImportChatBackupFile}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* ==================== TASKS ==================== */}
             {activeTab === "tasks" && (
               <div className="p-6 space-y-1">
@@ -2509,12 +2631,13 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                             { id: 'json', label: 'JSON' },
                             { id: 'zip', label: 'ZIP' },
                             { id: 'jsonl', label: 'JSONL' },
+                            { id: 'qcearchive', label: 'QCE Archive' },
                           ].map(tab => {
                             const isActive = (historyFormatFilter || 'all') === tab.id;
                             return (
                               <button
                                 key={tab.id}
-                                onClick={() => setHistoryFormatFilter(tab.id as 'all' | 'html' | 'json' | 'zip' | 'jsonl')}
+                                onClick={() => setHistoryFormatFilter(tab.id as 'all' | 'html' | 'json' | 'zip' | 'jsonl' | 'qcearchive')}
                                 className={`px-2 py-0.5 rounded-full text-[11px] transition-colors ${
                                   isActive 
                                     ? 'bg-black/[0.05] dark:bg-white/[0.05] text-foreground font-medium' 
@@ -2549,17 +2672,19 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                               const isJson = ext === 'json';
                               const isZip = ext === 'zip';
                               const isJsonl = file.fileName.includes('_chunked_jsonl');
+                              const isQceArchive = ext === 'qcearchive';
                               if (historyFormatFilter === 'html' && !isHtml) return false;
                               if (historyFormatFilter === 'json' && !isJson) return false;
                               if (historyFormatFilter === 'zip' && !isZip) return false;
                               if (historyFormatFilter === 'jsonl' && !isJsonl) return false;
+                              if (historyFormatFilter === 'qcearchive' && !isQceArchive) return false;
                             }
                             return true;
                           })
                           .map((file) => {
                             const ext = file.fileName.toLowerCase().split('.').pop();
                             const isJsonl = file.fileName.includes('_chunked_jsonl');
-                            const formatLabel = isJsonl ? 'JSONL' : ext === 'html' || ext === 'htm' ? 'HTML' : ext === 'json' ? 'JSON' : ext === 'zip' ? 'ZIP' : ext?.toUpperCase();
+                            const formatLabel = isJsonl ? 'JSONL' : ext === 'html' || ext === 'htm' ? 'HTML' : ext === 'json' ? 'JSON' : ext === 'zip' ? 'ZIP' : ext === 'qcearchive' ? 'QCE Archive' : ext?.toUpperCase();
                             
                             const resourceInfo = resourceIndex?.exports.find(e => 
                               e.fileName === file.fileName || 
@@ -3108,6 +3233,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
           handleOpenTaskWizard({
             chatType: peer.chatType,
             peerUid: peer.peerUid,
+            backupImportId: peer.backupImportId,
             sessionName: previewingChat?.name,
             startTime: timeRange?.startTime?.toString(),
             endTime: timeRange?.endTime?.toString()
@@ -3162,6 +3288,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
           const isJson = fileName.endsWith('.json')
           const isZip = fileName.endsWith('.zip')
           const isJsonl = fileName.includes('_chunked_jsonl') || fileName.includes('jsonl')
+          const isQceArchive = fileName.endsWith('.qcearchive')
           const fileSize = selectedFile.size || 0
           const isLargeFile = fileSize > 15 * 1024 * 1024
           const canPreview = (isHtml || isJson) && !isLargeFile && !isZip && !isJsonl
@@ -3236,7 +3363,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                 >
                   <div className="p-8 text-center">
                     <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-muted flex items-center justify-center">
-                      {isZip ? <Package className="w-8 h-8 text-muted-foreground/70" /> :
+                      {isZip || isQceArchive ? <Package className="w-8 h-8 text-muted-foreground/70" /> :
                        isJsonl ? <Database className="w-8 h-8 text-muted-foreground/70" /> :
                        <FileText className="w-8 h-8 text-muted-foreground/70" />}
                     </div>
@@ -3245,7 +3372,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                     </h3>
                     <div className="flex items-center justify-center gap-2 mb-4">
                       <Badge variant="outline">
-                        {isZip ? 'ZIP' : isJsonl ? 'JSONL' : isJson ? 'JSON' : 'FILE'}
+                        {isQceArchive ? 'QCE Archive' : isZip ? 'ZIP' : isJsonl ? 'JSONL' : isJson ? 'JSON' : 'FILE'}
                       </Badge>
                       {fileSize > 0 && (
                         <span className="text-sm text-muted-foreground">{formatSize(fileSize)}</span>
@@ -3253,7 +3380,9 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                     </div>
                     
                     <p className="text-muted-foreground mb-6">
-                      {isZip || isJsonl ? (
+                      {isQceArchive ? (
+                        '此归档包含 SQLite、媒体和解析 README，请下载后由工具解压读取'
+                      ) : isZip || isJsonl ? (
                         '此格式不支持在线预览，请下载后查看'
                       ) : isLargeFile ? (
                         '文件较大，建议下载后用专业编辑器打开'

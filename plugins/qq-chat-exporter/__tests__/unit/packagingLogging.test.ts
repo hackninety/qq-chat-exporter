@@ -28,6 +28,16 @@ test('packaging scripts enable NapCat file logs and propagate QCE log paths', ()
     assert.equal((installerService.match(/\.env\("QCE_LOG_DIR"/g) ?? []).length, 2);
 });
 
+test('Windows launchers elevate without rebuilding quoted cmd paths', () => {
+    const quickPack = read('scripts/quick-pack.py');
+
+    assert.equal((quickPack.match(/Start-Process @params/g) ?? []).length, 2);
+    assert.equal((quickPack.match(/QCE_ELEVATE_SCRIPT=%~f0/g) ?? []).length, 2);
+    assert.equal((quickPack.match(/Get-Command wt\.exe/g) ?? []).length, 1);
+    assert.ok(quickPack.includes("'-w new cmd.exe /d /c call '"));
+    assert.ok(!quickPack.includes('cmd /c cd /d \\\\"%~dp0\\\\"'));
+});
+
 test('bug-related issue forms require log and screenshot confirmation', () => {
     for (const template of [
         '.github/ISSUE_TEMPLATE/bug_report.yml',

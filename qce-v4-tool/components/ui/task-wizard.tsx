@@ -56,6 +56,7 @@ interface AdvancedPreferences {
 const createDefaultForm = (): CreateTaskForm => ({
   chatType: 2,
   peerUid: "",
+  backupImportId: undefined,
   peerUin: "",
   sessionName: "",
   format: "JSON",
@@ -150,6 +151,7 @@ const mergePrefilledForm = (
   return {
     chatType: prefilledData.chatType ?? base.chatType,
     peerUid: prefilledData.peerUid ?? base.peerUid,
+    backupImportId: prefilledData.backupImportId ?? base.backupImportId,
     peerUin: prefilledData.peerUin ?? base.peerUin,
     sessionName: prefilledData.sessionName ?? base.sessionName,
     format: prefilledData.format ?? base.format,
@@ -194,7 +196,7 @@ interface TaskWizardProps {
     type: 'group' | 'friend',
     id: string,
     name: string,
-    peer: { chatType: number, peerUid: string }
+    peer: { chatType: number, peerUid: string, backupImportId?: string }
   }) => void
   onExportAvatars?: (groupCode: string, groupName: string) => void
   avatarExportLoading?: string | null
@@ -298,6 +300,35 @@ export function TaskWizard({
         setSelectedTarget(found)
         setShowTargetSelector(false)
         didInitTargetRef.current = true
+        return
+      }
+
+      const sessionName = prefilledData.sessionName?.trim()
+      if (sessionName) {
+        const virtualTarget: Group | Friend = prefilledData.chatType === 2
+          ? {
+              groupCode: prefilledData.peerUid,
+              groupName: sessionName,
+              memberCount: 0,
+              maxMember: 0,
+              avatarUrl: `https://p.qlogo.cn/gh/${prefilledData.peerUid}/${prefilledData.peerUid}/640/`,
+            }
+          : {
+              uid: prefilledData.peerUid,
+              uin: Number(prefilledData.peerUin) || 0,
+              nick: sessionName,
+              remark: sessionName,
+              avatarUrl: prefilledData.peerUin
+                ? `https://q1.qlogo.cn/g?b=qq&nk=${prefilledData.peerUin}&s=640`
+                : undefined,
+              isOnline: false,
+              status: 0,
+              categoryId: 0,
+              chatType: prefilledData.chatType ?? 1,
+            }
+        setSelectedTarget(virtualTarget)
+        setShowTargetSelector(false)
+        didInitTargetRef.current = true
       }
     } else {
       setSelectedTarget(null)
@@ -366,6 +397,7 @@ export function TaskWizard({
         ...p,
         chatType: 2,
         peerUid: target.groupCode,
+        backupImportId: undefined,
         peerUin: target.groupCode,
         sessionName: target.groupName,
       }))
@@ -376,6 +408,7 @@ export function TaskWizard({
         ...p,
         chatType: target.chatType ?? 1,
         peerUid: target.uid,
+        backupImportId: undefined,
         peerUin: String(target.uin || ""),
         sessionName: target.remark || target.nick,
       }))
@@ -676,6 +709,7 @@ export function TaskWizard({
       ...p,
       chatType: 1, // 私聊
       peerUid: qqNumber,
+      backupImportId: undefined,
       peerUin: qqNumber,
       sessionName: manualSessionName.trim() || `好友 ${qqNumber}`
     }))
@@ -717,6 +751,7 @@ export function TaskWizard({
         ...p,
         chatType: 2,
         peerUid: groupCode,
+        backupImportId: undefined,
         peerUin: groupCode,
         sessionName: groupName,
       }))
@@ -1038,7 +1073,7 @@ export function TaskWizard({
             <div className="space-y-2">
               <label className="text-[13px] font-medium text-foreground/80">导出格式</label>
               <div className="flex items-center flex-wrap gap-1 p-1 rounded-[20px] bg-black/[0.04] dark:bg-white/[0.06] w-fit max-w-full">
-                {(["JSON", "HTML", "TXT", "EXCEL"] as const).map((fmt) => {
+                {(["JSON", "HTML", "TXT", "EXCEL", "QCEARCHIVE"] as const).map((fmt) => {
                   const active = form.format === fmt
                   return (
                     <button
@@ -1055,14 +1090,26 @@ export function TaskWizard({
                           ...p,
                           format: fmt,
                           filterPureImageMessages: fmt === "JSON" || fmt === "TXT",
+                          streamingZipMode:
+                            fmt === "JSON" || fmt === "HTML" ? p.streamingZipMode : false,
+                          exportAsZip: fmt === "HTML" ? p.exportAsZip : false,
+                          embedResourcesAsDataUri:
+                            fmt === "HTML" ? p.embedResourcesAsDataUri : false,
+                          embedAvatarsAsBase64:
+                            fmt === "JSON" ? p.embedAvatarsAsBase64 : false,
                         }))
                       }
                     >
-                      {fmt}
+                      {fmt === "QCEARCHIVE" ? "QCE Archive" : fmt}
                     </button>
                   )
                 })}
               </div>
+              {form.format === "QCEARCHIVE" && (
+                <p className="max-w-xl text-[12px] leading-relaxed text-muted-foreground/70">
+                  生成可供离线工具读取的 .qcearchive，内含已建索的 SQLite、媒体、manifest 和解析 README。
+                </p>
+              )}
             </div>
 
             <div className="space-y-2">
@@ -1463,7 +1510,11 @@ export function TaskWizard({
                             type: isGroup ? "group" : "friend",
                             id: isGroup ? selectedTarget.groupCode : selectedTarget.uid,
                             name: isGroup ? selectedTarget.groupName : selectedTarget.remark || selectedTarget.nick,
-                            peer: { chatType: isGroup ? 2 : 1, peerUid: isGroup ? selectedTarget.groupCode : selectedTarget.uid }
+                            peer: {
+                              chatType: isGroup ? 2 : 1,
+                              peerUid: isGroup ? selectedTarget.groupCode : selectedTarget.uid,
+                              backupImportId: form.backupImportId,
+                            }
                           })
                         }}
                       >

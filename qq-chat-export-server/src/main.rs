@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Extension, State};
+use axum::extract::{DefaultBodyLimit, Extension, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
@@ -15,11 +15,12 @@ use tower_http::services::ServeDir;
 
 use qce_server::api::middleware::{auth_middleware, request_id_middleware};
 use qce_server::api::routes::{
-    albums, files, friends, group_files, groups, messages, resources, scheduled, security,
-    stickers, system, tasks, users,
+    albums, backup_imports, files, friends, group_files, groups, messages, resources, scheduled,
+    security, stickers, system, tasks, users,
 };
 use qce_server::api::state::{AppState, SharedState};
 use qce_server::api::ws;
+use qce_server::backup_import::BackupImportManager;
 use qce_server::napcat::NapCatBridgeClient;
 use qce_server::paths::PathManager;
 use qce_server::progress::ProgressTracker;
@@ -102,6 +103,13 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|e| format!("数据库初始化失败: {e}"))?;
 
+    let backup_import_manager =
+        Arc::new(BackupImportManager::new(path_manager.backup_imports_dir()));
+    backup_import_manager
+        .initialize()
+        .await
+        .map_err(|e| format!("初始化聊天记录备份目录失败: {e}"))?;
+
     // NapCat bridge 客户端
     let napcat = NapCatBridgeClient::new(&bridge_endpoint, 120_000)
         .map_err(|e| format!("创建 bridge 客户端失败: {e}"))?;
@@ -148,6 +156,7 @@ async fn run() -> Result<(), String> {
     let (ws_tx, _) = broadcast::channel(1024);
     let state: SharedState = Arc::new(AppState {
         napcat,
+        backup_import_manager,
         db,
         resource_handler,
         progress_tracker,
@@ -243,6 +252,22 @@ fn build_router(
         .route("/api/friends", get(friends::list_friends))
         .route("/api/friends/:uid", get(friends::friend_detail))
         .route("/api/recent-contacts", get(friends::recent_contacts))
+        .route("/api/inactive-sessions", get(friends::inactive_sessions))
+        .route("/api/chat-backups", get(backup_imports::list_backups))
+        .route(
+            "/api/chat-backups/sessions",
+            get(backup_imports::list_backup_sessions),
+        )
+        .route(
+            "/api/chat-backups/detect-key",
+            post(backup_imports::detect_backup_key)
+                .layer(DefaultBodyLimit::max(16usize * 1024 * 1024)),
+        )
+        .route(
+            "/api/chat-backups/upload",
+            post(backup_imports::upload_backup)
+                .layer(DefaultBodyLimit::max(8usize * 1024 * 1024 * 1024)),
+        )
         .route("/api/users/lookup", get(users::lookup_user))
         .route("/api/users/:uid", get(users::user_detail))
         // 消息。

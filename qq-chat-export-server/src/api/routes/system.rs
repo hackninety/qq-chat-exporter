@@ -72,7 +72,8 @@ pub async fn root(
                 "好友管理": [
                     "GET /api/friends?page=1&limit=999 - 获取所有好友（支持分页）",
                     "GET /api/friends/:uid?no_cache=false - 获取好友详情",
-                    "GET /api/recent-contacts?limit=100&includeAll=false - 获取最近联系人中不属于好友/群聊的会话（QQ Bot、服务号等）"
+                    "GET /api/recent-contacts?limit=100&includeAll=false - 获取最近联系人中不属于好友/群聊的会话（QQ Bot、服务号等）",
+                    "GET /api/inactive-sessions?limit=2000 - 获取已不在当前好友或群列表中的本机历史会话"
                 ],
                 "消息处理": [
                     "POST /api/messages/fetch - 批量获取消息",

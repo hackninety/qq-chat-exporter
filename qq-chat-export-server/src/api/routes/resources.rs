@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path as FsPath, PathBuf};
 
 use axum::extract::{Extension, Path, Query, State};
@@ -261,11 +262,12 @@ fn base_name_re() -> &'static regex::Regex {
     })
 }
 
-/// 解析普通导出文件名（`.html` / `.json`，兼容 `_NNN_TEMP` 后缀）。
+/// 解析普通导出文件名（HTML / JSON / QCE Archive，兼容 `_NNN_TEMP` 后缀）。
 fn parse_export_file_name(file_name: &str) -> Option<Value> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)^(.+?)(?:_\d{3}_TEMP)?\.(html|json)$").expect("valid regex")
+        regex::Regex::new(r"(?i)^(.+?)(?:_\d{3}_TEMP)?\.(html|json|qcearchive)$")
+            .expect("valid regex")
     });
     let caps = re.captures(file_name)?;
     let base = caps.get(1)?.as_str();
@@ -276,7 +278,11 @@ fn parse_export_file_name(file_name: &str) -> Option<Value> {
         "chatId": chat_id,
         "exportDate": export_date,
         "displayName": display_name,
-        "format": if ext == "json" { "JSON" } else { "HTML" },
+        "format": match ext.as_str() {
+            "json" => "JSON",
+            "qcearchive" => "QCEARCHIVE",
+            _ => "HTML",
+        },
         "avatarUrl": avatar_url(&chat_type, &chat_id),
     }))
 }
@@ -397,6 +403,36 @@ fn parse_json_metadata(file_path: &FsPath) -> FileMetadata {
     }
 }
 
+/// 从 QCE Archive 的限长 `manifest.json` 提取列表元数据。
+fn parse_qce_archive_metadata(file_path: &FsPath) -> FileMetadata {
+    const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+    let Ok(file) = std::fs::File::open(file_path) else {
+        return FileMetadata::default();
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return FileMetadata::default();
+    };
+    let Ok(mut entry) = archive.by_name("manifest.json") else {
+        return FileMetadata::default();
+    };
+    if entry.size() > MAX_MANIFEST_BYTES {
+        return FileMetadata::default();
+    }
+    let mut content = String::new();
+    if entry
+        .by_ref()
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_string(&mut content)
+        .is_err()
+    {
+        return FileMetadata::default();
+    }
+    serde_json::from_str::<Value>(&content).map_or_else(
+        |_| FileMetadata::default(),
+        |manifest| parse_manifest_metadata(&manifest),
+    )
+}
+
 fn apply_file_metadata(file_info: &mut Value, metadata: FileMetadata) {
     if let Some(count) = metadata.message_count {
         file_info["messageCount"] = json!(count);
@@ -423,15 +459,20 @@ fn parse_manifest_metadata(manifest: &Value) -> FileMetadata {
         message_count: manifest
             .pointer("/statistics/totalMessages")
             .or_else(|| manifest.pointer("/stats/totalMessages"))
+            .or_else(|| manifest.pointer("/counts/messages"))
             .and_then(Value::as_i64),
         chat_name: metadata_string(manifest, "/chatInfo/name")
-            .or_else(|| metadata_string(manifest, "/chat/name")),
+            .or_else(|| metadata_string(manifest, "/chat/name"))
+            .or_else(|| metadata_string(manifest, "/conversation/name")),
         peer_uid: metadata_string(manifest, "/chatInfo/peerUid")
-            .or_else(|| metadata_string(manifest, "/chat/peerUid")),
+            .or_else(|| metadata_string(manifest, "/chat/peerUid"))
+            .or_else(|| metadata_string(manifest, "/conversation/peerUid")),
         peer_uin: metadata_string(manifest, "/chatInfo/peerUin")
-            .or_else(|| metadata_string(manifest, "/chat/peerUin")),
+            .or_else(|| metadata_string(manifest, "/chat/peerUin"))
+            .or_else(|| metadata_string(manifest, "/conversation/peerUin")),
         avatar_url: metadata_string(manifest, "/chatInfo/avatar")
-            .or_else(|| metadata_string(manifest, "/chat/avatar")),
+            .or_else(|| metadata_string(manifest, "/chat/avatar"))
+            .or_else(|| metadata_string(manifest, "/conversation/avatarUrl")),
         ..FileMetadata::default()
     }
 }
@@ -548,7 +589,10 @@ async fn scan_export_dir(
             }
         } else if meta.is_file() && normalized.ends_with("_streaming.zip") {
             info = parse_streaming_zip_file_name(&file_name);
-        } else if meta.is_file() && (normalized.ends_with(".html") || normalized.ends_with(".json"))
+        } else if meta.is_file()
+            && (normalized.ends_with(".html")
+                || normalized.ends_with(".json")
+                || normalized.ends_with(".qcearchive"))
         {
             if let Some(mut file_info) = parse_export_file_name(&file_name) {
                 let format = file_info
@@ -560,6 +604,8 @@ async fn scan_export_dir(
                     apply_file_metadata(&mut file_info, parse_html_metadata(&file_path));
                 } else if format == "JSON" {
                     apply_file_metadata(&mut file_info, parse_json_metadata(&file_path));
+                } else if format == "QCEARCHIVE" {
+                    apply_file_metadata(&mut file_info, parse_qce_archive_metadata(&file_path));
                 }
                 info = Some(file_info);
             }
@@ -648,7 +694,7 @@ pub async fn export_file_info(
     };
     let file_path = resolved.path;
     let is_scheduled = resolved.is_scheduled;
-    let Some(basic_info) = parse_export_file_name(&file_name) else {
+    let Some(mut basic_info) = parse_export_file_name(&file_name) else {
         let err = ApiError::validation("无效的文件名格式", "INVALID_FILENAME");
         return response::error(&err, &request_id);
     };
@@ -656,6 +702,11 @@ pub async fn export_file_info(
         let err = ApiError::validation("导出文件不存在", "FILE_NOT_FOUND");
         return response::error(&err, &request_id);
     };
+
+    let is_qce_archive = basic_info.get("format").and_then(Value::as_str) == Some("QCEARCHIVE");
+    if is_qce_archive {
+        apply_file_metadata(&mut basic_info, parse_qce_archive_metadata(&file_path));
+    }
 
     // 从文件内容提取详细信息。
     let mut detailed = serde_json::Map::new();
@@ -693,7 +744,18 @@ pub async fn export_file_info(
                 }
             }
         }
-    } else if let Ok(html_content) = std::fs::read_to_string(&file_path) {
+    } else if !is_qce_archive {
+        let Ok(html_content) = std::fs::read_to_string(&file_path) else {
+            return export_file_info_response(
+                basic_info,
+                detailed,
+                &file_name,
+                &file_path,
+                &meta,
+                is_scheduled,
+                &request_id,
+            );
+        };
         for (pattern, key) in [
             (
                 r"<title>([^<]+?)(?:\s*-\s*聊天记录)?</title>",
@@ -721,7 +783,27 @@ pub async fn export_file_info(
         }
     }
 
-    let (create_time, modify_time) = file_times(&meta);
+    export_file_info_response(
+        basic_info,
+        detailed,
+        &file_name,
+        &file_path,
+        &meta,
+        is_scheduled,
+        &request_id,
+    )
+}
+
+fn export_file_info_response(
+    basic_info: Value,
+    detailed: serde_json::Map<String, Value>,
+    file_name: &str,
+    file_path: &FsPath,
+    meta: &std::fs::Metadata,
+    is_scheduled: bool,
+    request_id: &str,
+) -> Response {
+    let (create_time, modify_time) = file_times(meta);
     let prefix = if is_scheduled {
         "/scheduled-downloads"
     } else {
@@ -746,7 +828,7 @@ pub async fn export_file_info(
             obj.insert(key, value);
         }
     }
-    response::success(result, &request_id)
+    response::success(result, request_id)
 }
 
 // DELETE /api/exports/files/:fileName（Issue #32）
@@ -761,6 +843,21 @@ pub async fn delete_export_file(
         let err = ApiError::validation("文件不存在", "FILE_NOT_FOUND");
         return response::error(&err, &request_id);
     };
+    if file_name.to_lowercase().ends_with(".qcearchive") {
+        return if tokio::fs::remove_file(&resolved.path).await.is_ok() {
+            response::success(
+                json!({ "message": "文件删除成功", "deleted": ["QCE Archive"] }),
+                &request_id,
+            )
+        } else {
+            let error = ApiError::new(
+                ErrorType::FileSystem,
+                "QCE Archive 删除失败",
+                "FILE_DELETE_ERROR",
+            );
+            response::error(&error, &request_id)
+        };
+    }
     let base_dir = resolved.base_dir;
 
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -1474,7 +1571,15 @@ pub async fn download_file(
 
     // 只允许下载导出文件扩展名。
     let ext = ext_of(raw_path);
-    let allowed = [".json", ".html", ".txt", ".xlsx", ".zip", ".jsonl"];
+    let allowed = [
+        ".json",
+        ".html",
+        ".txt",
+        ".xlsx",
+        ".zip",
+        ".jsonl",
+        ".qcearchive",
+    ];
     if !allowed.contains(&ext.as_str()) {
         return response::error(
             &permission_err("不允许下载此类型的文件", "FORBIDDEN_FILE_TYPE"),
@@ -1520,6 +1625,7 @@ pub async fn download_file(
         ".txt" => "text/plain",
         ".xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         ".zip" => "application/zip",
+        ".qcearchive" => "application/vnd.qq-chat-exporter.archive+zip",
         ".jsonl" => "application/x-ndjson",
         _ => "application/octet-stream",
     };
@@ -2288,6 +2394,26 @@ mod metadata_tests {
             file["avatarUrl"],
             "https://q1.qlogo.cn/g?b=qq&nk=1687657986&s=100"
         );
+
+        let archive_manifest = json!({
+            "format": "qcearchive",
+            "counts": { "messages": 42 },
+            "conversation": {
+                "name": "已删除好友",
+                "peerUid": "u_deleted",
+                "peerUin": "123456",
+                "avatarUrl": "https://example.invalid/avatar"
+            }
+        });
+        let mut archive_file = json!({});
+        apply_file_metadata(
+            &mut archive_file,
+            parse_manifest_metadata(&archive_manifest),
+        );
+        assert_eq!(archive_file["displayName"], "已删除好友");
+        assert_eq!(archive_file["messageCount"], 42);
+        assert_eq!(archive_file["peerUid"], "u_deleted");
+        assert_eq!(archive_file["peerUin"], "123456");
     }
 
     #[test]
@@ -2355,6 +2481,12 @@ mod metadata_tests {
         assert_eq!(modern["chatId"], "1687657986");
         assert_eq!(modern["displayName"], "笨蛋Darf v2");
         assert_eq!(modern["exportDate"], "2026-07-13 00:27:03");
+
+        let archive =
+            parse_export_file_name("friend_笨蛋Darf_v2_1687657986_20260713_002703456.qcearchive")
+                .unwrap();
+        assert_eq!(archive["format"], "QCEARCHIVE");
+        assert_eq!(archive["chatId"], "1687657986");
 
         let duplicate =
             parse_manual_export_file_name("group_AxT_鸽子窝_960420904_20260713_002703456_2.json")

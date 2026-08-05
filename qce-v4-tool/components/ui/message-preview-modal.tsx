@@ -31,7 +31,7 @@ interface MessagePreviewModalProps {
     type: 'group' | 'friend'
     id: string
     name: string
-    peer: { chatType: number, peerUid: string }
+    peer: { chatType: number, peerUid: string, backupImportId?: string }
   } | null
   onExport?: (peer: any, timeRange?: { startTime?: number, endTime?: number }) => void
 }
@@ -65,6 +65,45 @@ function marketFaceUrls(emojiId: string): { primary: string, fallback: string } 
   const prefix = emojiId.slice(0, 2)
   const base = `https://gxh.vip.qq.com/club/item/parcel/item/${prefix}/${emojiId}/raw300`
   return { primary: `${base}.gif`, fallback: `${base}.png` }
+}
+
+function nestedCardString(value: unknown, keys: string[], depth = 0): string | undefined {
+  if (!value || typeof value !== 'object' || depth > 4) return undefined
+  const record = value as Record<string, unknown>
+  for (const key of keys) {
+    const candidate = record[key]
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
+  }
+  for (const candidate of Object.values(record)) {
+    if (Array.isArray(candidate)) {
+      for (const item of candidate) {
+        const found = nestedCardString(item, keys, depth + 1)
+        if (found) return found
+      }
+    } else {
+      const found = nestedCardString(candidate, keys, depth + 1)
+      if (found) return found
+    }
+  }
+  return undefined
+}
+
+function arkCardDetails(raw: unknown): { label: string, url?: string, isMultiForward: boolean } {
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return { label: '卡片消息', isMultiForward: false }
+  }
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    const label = nestedCardString(parsed, ['prompt', 'title', 'desc', 'contentText', 'detailDesc']) || '卡片消息'
+    const candidateUrl = nestedCardString(parsed, ['url', 'jumpUrl', 'mailUrl', 'mailUrlByCode'])
+    return {
+      label,
+      url: candidateUrl && /^https?:\/\//i.test(candidateUrl) ? candidateUrl : undefined,
+      isMultiForward: parsed.app === 'com.tencent.multimsg',
+    }
+  } catch {
+    return { label: '卡片消息', isMultiForward: false }
+  }
 }
 
 export function MessagePreviewModal({ open, onClose, chat, onExport }: MessagePreviewModalProps) {
@@ -135,7 +174,13 @@ export function MessagePreviewModal({ open, onClose, chat, onExport }: MessagePr
       const response = await fetch('/api/messages/fetch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ peer: chat.peer, page, limit: MESSAGES_PER_PAGE, filter: finalFilter })
+        body: JSON.stringify({
+          peer: chat.peer,
+          page,
+          limit: MESSAGES_PER_PAGE,
+          filter: finalFilter,
+          ...(filter?.searchQuery && { searchQuery: filter.searchQuery }),
+        })
       })
 
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`)
@@ -157,6 +202,19 @@ export function MessagePreviewModal({ open, onClose, chat, onExport }: MessagePr
   const handleSearch = () => {
     if (!searchQuery.trim()) { handleTimeRangeChange(); return }
     if (!chat) return
+
+    if (chat.peer.backupImportId) {
+      const filter = {
+        startTime: startDate ? new Date(startDate).getTime() : 0,
+        endTime: endDate ? (new Date(endDate).getTime() + 86400000 - 1) : Date.now(),
+        searchQuery: searchQuery.trim(),
+      }
+      setUseStreamMode(false)
+      setCurrentPage(1)
+      setCurrentFilter({ startTime: filter.startTime, endTime: filter.endTime })
+      fetchMessages(1, filter)
+      return
+    }
     
     setUseStreamMode(true)
     setLoading(true)
@@ -340,14 +398,34 @@ export function MessagePreviewModal({ open, onClose, chat, onExport }: MessagePr
         )
         hasContent = true
       } else if (el.arkElement) {
-        nodes.push(<span key={`ark-${i}`} className="text-muted-foreground/70">[卡片消息]</span>)
+        const card = arkCardDetails(el.arkElement.bytesData)
+        nodes.push(card.url ? (
+          <a key={`ark-${i}`} href={card.url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-foreground decoration-dashed underline underline-offset-2 hover:text-blue-600 transition-colors">
+            <span>{card.label}</span>
+            <ExternalLink className="w-3 h-3 shrink-0 opacity-50" />
+          </a>
+        ) : (
+          <span key={`ark-${i}`} className="text-muted-foreground/70">[{card.label}]</span>
+        ))
         hasContent = true
       } else if (el.grayTipElement) {
         const tip = el.grayTipElement.xmlElement?.content || el.grayTipElement.jsonGrayTipElement?.jsonStr || ''
         nodes.push(<span key={`tip-${i}`} className="text-muted-foreground/50 italic text-xs">{tip || '[系统提示]'}</span>)
         hasContent = true
       } else if (el.multiForwardMsgElement) {
-        nodes.push(<span key={`fwd-${i}`} className="text-muted-foreground/70">[合并转发]</span>)
+        const card = arkCardDetails(el.multiForwardMsgElement.xmlContent)
+        if (!card.isMultiForward && card.label !== '卡片消息') {
+          nodes.push(card.url ? (
+            <a key={`fwd-card-${i}`} href={card.url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-foreground decoration-dashed underline underline-offset-2 hover:text-blue-600 transition-colors">
+              <span>{card.label}</span>
+              <ExternalLink className="w-3 h-3 shrink-0 opacity-50" />
+            </a>
+          ) : (
+            <span key={`fwd-card-${i}`} className="text-muted-foreground/70">[{card.label}]</span>
+          ))
+        } else {
+          nodes.push(<span key={`fwd-${i}`} className="text-muted-foreground/70">[合并转发 · 备份未包含内层消息]</span>)
+        }
         hasContent = true
       } else if (el.faceBubbleElement) {
         const text = el.faceBubbleElement?.richNameElement?.textElement?.content || '表情气泡'
@@ -455,6 +533,7 @@ export function MessagePreviewModal({ open, onClose, chat, onExport }: MessagePr
               <h2 className="text-base font-semibold text-foreground leading-tight">{chat.name}</h2>
               <p className="text-xs text-muted-foreground">
                 {chat.type === 'group' ? '群聊' : '好友'}
+                {chat.peer.backupImportId && ' · 已导入备份'}
                 <span aria-hidden className="mx-1 inline-block h-3 w-px translate-y-[2px] bg-current opacity-25" />
                 {totalCount.toLocaleString()} 条消息
               </p>
@@ -584,7 +663,7 @@ export function MessagePreviewModal({ open, onClose, chat, onExport }: MessagePr
                             {msg.sendMemberName || msg.sendNickName || `用户${msg.senderUin}`}
                           </span>
                           <span className="text-xs text-muted-foreground/50">
-                            {format(new Date(msg.msgTime * 1000), 'MM-dd HH:mm')}
+                            {format(new Date(msg.msgTime * 1000), 'yyyy MM-dd HH:mm')}
                           </span>
                         </div>
                         <p className="text-sm text-foreground/80 break-words leading-relaxed">

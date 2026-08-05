@@ -160,6 +160,24 @@ export function privateDeactivatedFriend(): MockConversation {
         .build();
 }
 
+/** 不在当前好友列表、但仍出现在 NTQQ 本地会话索引中的私聊。 */
+export function indexedNonFriendConversation(): MockConversation {
+    resetIds();
+    return conversation(privatePeer('u_inactive_66666'), { name: '已删除的测试好友', type: 'private' })
+        .add(msg().sender({ uid: 'u_inactive_66666', uin: '66666', nick: '旧好友' }).text('这条消息来自非好友会话').at_time(T + 480).build())
+        .add(msg().sender({ uid: 'self_test_uid', uin: '10000', nick: 'TestSelf' }).text('历史回复').at_time(T + 540).build())
+        .build();
+}
+
+/** 当前群列表中不存在、但本机仍保留历史消息的旧群聊。 */
+export function unavailableGroupConversation(): MockConversation {
+    resetIds();
+    return conversation(groupPeer('888000'), { name: '已经退出的测试群', type: 'group', participantCount: 2 })
+        .add(msg().sender({ uid: 'u_alice', uin: '11111', nick: 'Alice' }).text('旧群里的最后一条消息').at_time(T + 600).build())
+        .add(msg().sender({ uid: 'self_test_uid', uin: '10000', nick: 'TestSelf' }).text('收到').at_time(T + 660).build())
+        .build();
+}
+
 /**
  * Creates `count` text messages spanning `count` minutes. Used by fetcher
  * pagination tests — the BatchMessageFetcher splits this across batches and

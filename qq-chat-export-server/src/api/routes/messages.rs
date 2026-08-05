@@ -15,6 +15,7 @@ use qce_exporter::json_exporter::{
 use qce_exporter::modern_html_exporter::{
     ChunkedHtmlExportOptions, HtmlExportOptions, ModernHtmlExporter,
 };
+use qce_exporter::qce_archive_exporter::{QceArchiveExporter, QceArchiveFormatOptions};
 use qce_exporter::text_exporter::{TextExporter, TextFormatOptions};
 use qce_exporter::types::MessageResource;
 use qce_exporter::{ChatInfo, CleanMessage, ExportOptions};
@@ -455,6 +456,51 @@ pub async fn fetch_messages(
         }
     }
 
+    if let Some(import_id) = body
+        .pointer("/peer/backupImportId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let search = body
+            .get("searchQuery")
+            .or_else(|| filter.get("searchQuery"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        return match state
+            .backup_import_manager
+            .fetch_messages(
+                import_id.to_string(),
+                chat_type,
+                peer_uid,
+                page,
+                limit,
+                start_time,
+                end_time,
+                search,
+            )
+            .await
+        {
+            Ok(result) => response::success(
+                json!({
+                    "messages": result.messages,
+                    "totalCount": result.total_count,
+                    "currentPage": result.current_page,
+                    "totalPages": result.total_pages,
+                    "hasNext": result.has_next,
+                    "cacheHit": false,
+                    "source": "backup",
+                    "fetchedAt": now_iso(),
+                }),
+                &request_id,
+            ),
+            Err(error) => {
+                let err = ApiError::new(ErrorType::Database, error.to_string(), error.code());
+                response::error(&err, &request_id)
+            }
+        };
+    }
+
     let now = now_ms();
     let cache_key = format!(
         "{chat_type}_{peer_uid}_{}_{}",
@@ -682,6 +728,7 @@ struct ExportRequest {
     peer_uid: String,
     peer_identity: String,
     peer_uin: Option<String>,
+    backup_import_id: Option<String>,
     filter: Value,
     options: Value,
     session_name: String,
@@ -691,6 +738,21 @@ struct ExportRequest {
     use_friendly_file_name: bool,
     date_str: String,
     time_str: String,
+}
+
+fn export_task_peer(req: &ExportRequest) -> Value {
+    let mut peer = json!({
+        "chatType": req.chat_type,
+        "peerUid": req.peer_uid,
+    });
+    if let (Some(object), Some(import_id)) = (peer.as_object_mut(), req.backup_import_id.as_deref())
+    {
+        object.insert(
+            "backupImportId".to_string(),
+            Value::String(import_id.to_string()),
+        );
+    }
+    peer
 }
 
 async fn prepare_output_directory(
@@ -741,8 +803,18 @@ async fn prepare_export_request(
     let Some((chat_type, raw_peer_uid)) = parse_peer(body) else {
         return Err(ApiError::validation("peer参数不完整", "INVALID_PEER"));
     };
+    let backup_import_id = body
+        .pointer("/peer/backupImportId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     // Issue #226 / #353：支持通过 QQ 号导出，自动转换为 uid。
-    let peer_uid = resolve_peer_uid(chat_type, &raw_peer_uid, &state.napcat).await;
+    let peer_uid = if backup_import_id.is_some() {
+        raw_peer_uid.clone()
+    } else {
+        resolve_peer_uid(chat_type, &raw_peer_uid, &state.napcat).await
+    };
     let request_peer_uin = body
         .pointer("/peer/peerUin")
         .and_then(Value::as_str)
@@ -802,6 +874,7 @@ async fn prepare_export_request(
         peer_uid,
         peer_identity,
         peer_uin,
+        backup_import_id,
         use_name_in_file_name: options.get("useNameInFileName").and_then(Value::as_bool)
             == Some(true),
         use_friendly_file_name: options.get("useFriendlyFileName").and_then(Value::as_bool)
@@ -845,6 +918,17 @@ async fn register_task(state: &SharedState, task: &Value) -> bool {
     true
 }
 
+fn export_file_extension(format: &str) -> Option<&'static str> {
+    match format {
+        "TXT" => Some("txt"),
+        "HTML" => Some("html"),
+        "EXCEL" => Some("xlsx"),
+        "QCEARCHIVE" => Some("qcearchive"),
+        "JSON" => Some("json"),
+        _ => None,
+    }
+}
+
 /// `POST /api/messages/export` — 创建异步导出任务。
 pub async fn export_messages(
     State(state): State<SharedState>,
@@ -860,11 +944,14 @@ pub async fn export_messages(
         .and_then(Value::as_str)
         .unwrap_or("JSON")
         .to_uppercase();
-    let file_ext = match format.as_str() {
-        "TXT" => "txt",
-        "HTML" => "html",
-        "EXCEL" => "xlsx",
-        _ => "json",
+    let Some(file_ext) = export_file_extension(&format) else {
+        let error = ApiError::new(
+            ErrorType::Api,
+            format!("不支持的导出格式: {format}"),
+            "UNSUPPORTED_EXPORT_FORMAT",
+        )
+        .with_status(axum::http::StatusCode::BAD_REQUEST);
+        return response::error(&error, &request_id);
     };
 
     let task_id = generate_task_id("export");
@@ -890,7 +977,7 @@ pub async fn export_messages(
 
     let task = json!({
         "taskId": task_id,
-        "peer": { "chatType": req.chat_type, "peerUid": req.peer_uid },
+        "peer": export_task_peer(&req),
         "sessionName": req.session_name,
         "fileName": file_name,
         "downloadUrl": download_url,
@@ -983,7 +1070,7 @@ pub async fn export_streaming_zip(
     }
     let task = json!({
         "taskId": task_id,
-        "peer": { "chatType": req.chat_type, "peerUid": req.peer_uid },
+        "peer": export_task_peer(&req),
         "sessionName": req.session_name,
         "fileName": file_name,
         "downloadUrl": download_url,
@@ -1072,7 +1159,7 @@ pub async fn export_streaming_jsonl(
     }
     let task = json!({
         "taskId": task_id,
-        "peer": { "chatType": req.chat_type, "peerUid": req.peer_uid },
+        "peer": export_task_peer(&req),
         "sessionName": req.session_name,
         "fileName": dir_name,
         "downloadUrl": download_url,
@@ -1516,47 +1603,73 @@ async fn process_export_task(
         ..MessageFilter::default()
     };
 
-    let mut all_messages: Vec<Value> = Vec::new();
-    let mut previous = None;
-    let mut batch_count: i64 = 0;
-    loop {
-        if is_cancelled(state, task_id, cancel_flag).await {
-            fetcher.cancel();
-            return Err("任务已被用户停止".to_string());
-        }
-        let fetch_result = tokio::select! {
-            result = fetcher.fetch_next_batch(&peer, &fetch_filter, previous.as_ref()) => Some(result),
-            () = wait_for_atomic_cancellation(cancel_flag) => None,
-        };
-        let Some(fetch_result) = fetch_result else {
-            fetcher.cancel();
-            return Err("任务已被用户停止".to_string());
-        };
-        let mut batch = match fetch_result {
-            Ok(Some(batch)) => batch,
-            Ok(None) => break,
-            Err(error) => return Err(format!("获取消息失败: {error}")),
-        };
-        batch_count += 1;
-        all_messages.append(&mut batch.messages);
-
-        let progress = (batch_count * 10).min(50);
-        let message = format!("已获取 {} 条消息...", all_messages.len());
+    let is_backup_import = req.backup_import_id.is_some();
+    let mut all_messages: Vec<Value> = if let Some(import_id) = &req.backup_import_id {
+        let messages = state
+            .backup_import_manager
+            .fetch_all_messages(
+                import_id.clone(),
+                req.chat_type,
+                req.peer_uid.clone(),
+                Some(start_time_ms),
+                Some(end_time_ms),
+            )
+            .await
+            .map_err(|error| format!("读取导入聊天记录失败: {error}"))?;
+        let message = format!("已从备份读取 {} 条消息...", messages.len());
         update_task(
             state,
             task_id,
-            json!({ "progress": progress, "messageCount": all_messages.len(), "message": message }),
+            json!({ "progress": 50, "messageCount": messages.len(), "message": message }),
         )
         .await;
-        broadcast_progress(state, task_id, progress, &message, all_messages.len());
-        previous = Some(batch);
+        broadcast_progress(state, task_id, 50, &message, messages.len());
+        messages
+    } else {
+        Vec::new()
+    };
+    let mut previous = None;
+    let mut batch_count: i64 = 0;
+    if !is_backup_import {
+        loop {
+            if is_cancelled(state, task_id, cancel_flag).await {
+                fetcher.cancel();
+                return Err("任务已被用户停止".to_string());
+            }
+            let fetch_result = tokio::select! {
+                result = fetcher.fetch_next_batch(&peer, &fetch_filter, previous.as_ref()) => Some(result),
+                () = wait_for_atomic_cancellation(cancel_flag) => None,
+            };
+            let Some(fetch_result) = fetch_result else {
+                fetcher.cancel();
+                return Err("任务已被用户停止".to_string());
+            };
+            let mut batch = match fetch_result {
+                Ok(Some(batch)) => batch,
+                Ok(None) => break,
+                Err(error) => return Err(format!("获取消息失败: {error}")),
+            };
+            batch_count += 1;
+            all_messages.append(&mut batch.messages);
+
+            let progress = (batch_count * 10).min(50);
+            let message = format!("已获取 {} 条消息...", all_messages.len());
+            update_task(
+                state,
+                task_id,
+                json!({ "progress": progress, "messageCount": all_messages.len(), "message": message }),
+            )
+            .await;
+            broadcast_progress(state, task_id, progress, &message, all_messages.len());
+            previous = Some(batch);
+        }
     }
 
     if is_cancelled(state, task_id, cancel_flag).await {
         return Err("任务已被用户停止".to_string());
     }
 
-    if req.chat_type == GROUP_CHAT_TYPE && !all_messages.is_empty() {
+    if !is_backup_import && req.chat_type == GROUP_CHAT_TYPE && !all_messages.is_empty() {
         match repair_group_message_sequence(
             &state.napcat,
             &peer,
@@ -1589,7 +1702,7 @@ async fn process_export_task(
 
     // 群昵称补全 + 群头衔映射（issue #331）
     let mut title_map: Option<HashMap<String, String>> = None;
-    if req.chat_type == GROUP_CHAT_TYPE && !all_messages.is_empty() {
+    if !is_backup_import && req.chat_type == GROUP_CHAT_TYPE && !all_messages.is_empty() {
         fill_group_member_names(state, &req.peer_uid, &mut all_messages).await;
         title_map = fetch_group_member_title_map(state, &req.peer_uid, req.chat_type).await;
     }
@@ -1633,7 +1746,8 @@ async fn process_export_task(
             .and_then(Value::as_bool)
             .unwrap_or(true),
         sender_title_resolver,
-        forward_fetcher: Some(Arc::new(state.napcat.clone()) as Arc<dyn ForwardFetcher>),
+        forward_fetcher: (!is_backup_import)
+            .then(|| Arc::new(state.napcat.clone()) as Arc<dyn ForwardFetcher>),
     });
     let mut clean_messages: Vec<CleanMessage> = parser.parse_messages(&filtered_messages).await;
     if let Some(debug) = &debug_session {
@@ -1926,6 +2040,26 @@ async fn process_export_task(
                         .await
                         .map_err(|e| e.to_string())?;
                 }
+                "QCEARCHIVE" => {
+                    broadcast_progress(
+                        state,
+                        task_id,
+                        90,
+                        "正在写入 SQLite 并封装 QCE Archive...",
+                        message_count,
+                    );
+                    let exporter = QceArchiveExporter::new(
+                        export_options,
+                        QceArchiveFormatOptions {
+                            exporter_version: Some(crate::version::VERSION.get().to_string()),
+                        },
+                    );
+                    exporter
+                        .export(clean_messages, &chat_info)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    broadcast_progress(state, task_id, 96, "QCE Archive 封装完成", message_count);
+                }
                 _ => return Err("不支持的导出格式".to_string()),
             }
 
@@ -2160,10 +2294,46 @@ async fn dir_or_file_size(path: &FsPath) -> u64 {
 #[cfg(test)]
 mod file_name_tests {
     use super::{
-        build_export_dir_name, build_export_file_name, prepare_output_directory,
-        release_export_path, reserve_export_file_name, sanitize_chat_name, should_apply_task_patch,
+        build_export_dir_name, build_export_file_name, export_file_extension, export_task_peer,
+        prepare_output_directory, release_export_path, reserve_export_file_name,
+        sanitize_chat_name, should_apply_task_patch, ExportRequest,
     };
     use serde_json::json;
+
+    fn export_request_with_backup(backup_import_id: Option<&str>) -> ExportRequest {
+        ExportRequest {
+            chat_type: 1,
+            peer_uid: "u_peer".to_string(),
+            peer_identity: "10001".to_string(),
+            peer_uin: Some("10001".to_string()),
+            backup_import_id: backup_import_id.map(str::to_string),
+            filter: json!(null),
+            options: json!(null),
+            session_name: "会话".to_string(),
+            custom_output_dir: String::new(),
+            output_dir: std::path::PathBuf::new(),
+            use_name_in_file_name: false,
+            use_friendly_file_name: false,
+            date_str: String::new(),
+            time_str: String::new(),
+        }
+    }
+
+    #[test]
+    fn task_peer_only_adds_backup_id_for_imported_sessions() {
+        let normal = export_task_peer(&export_request_with_backup(None));
+        assert!(normal.get("backupImportId").is_none());
+
+        let imported = export_task_peer(&export_request_with_backup(Some("backup01")));
+        assert_eq!(imported["backupImportId"], "backup01");
+    }
+
+    #[test]
+    fn qce_archive_uses_its_public_file_extension() {
+        assert_eq!(export_file_extension("QCEARCHIVE"), Some("qcearchive"));
+        assert_eq!(export_file_extension("JSON"), Some("json"));
+        assert_eq!(export_file_extension("UNKNOWN"), None);
+    }
 
     #[tokio::test]
     async fn creates_missing_allowed_output_directory_before_task_registration() {

@@ -41,9 +41,8 @@ pub fn render_reply_preview_element(pe: &Value, ctx: &ReplyPreviewRenderContext<
             let local_path = get_str(pe, "localPath").unwrap_or("");
             if !local_path.is_empty() {
                 let base = base_name(local_path);
-                let img_src = (ctx.lookup_data_uri)("images", &base).unwrap_or_else(|| {
-                    format!("{}/{}", ctx.resource_base_href, local_path)
-                });
+                let img_src = (ctx.lookup_data_uri)("images", &base)
+                    .unwrap_or_else(|| format!("{}/{}", ctx.resource_base_href, local_path));
                 return format!(
                     "<img src=\"{img_src}\" class=\"reply-content-thumb\" alt=\"引用图片\" loading=\"lazy\">"
                 );

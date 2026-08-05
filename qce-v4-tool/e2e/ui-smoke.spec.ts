@@ -354,6 +354,301 @@ test.describe('Session list — QQ lookup (issue #204)', () => {
     });
 });
 
+test.describe('Inactive sessions', () => {
+    async function authenticate(page: import('@playwright/test').Page) {
+        await clearLocalStorage(page);
+        await page.evaluate((value) => {
+            localStorage.setItem('qce_access_token', value);
+            localStorage.setItem('qce-onboarding-completed', 'true');
+        }, TOKEN);
+    }
+
+    test('sidebar list previews non-friends and unavailable groups, then opens export preset', async ({ page }) => {
+        await authenticate(page);
+        const response = await page.goto(`${FRONTEND_BASE}${SHELL_PATH}`).catch(() => null);
+        test.skip(!response || response.status() >= 500, `frontend not reachable at ${FRONTEND_BASE}`);
+
+        const inactiveTab = page.getByRole('button', { name: '已删除/退出', exact: true });
+        await expect(inactiveTab).toBeVisible({ timeout: 15_000 });
+        await inactiveTab.click();
+
+        await expect(page.getByRole('button', { name: '全部 (2)' })).toBeVisible({ timeout: 15_000 });
+        await expect(page.getByText('已删除的测试好友（66666）', { exact: true })).toBeVisible();
+        await expect(page.getByText('u_inactive_66666', { exact: true })).toHaveCount(0);
+        await expect(page.getByText('已经退出的测试群（888000）', { exact: true })).toBeVisible();
+        await expect(page.getByText('QCE Testing Group', { exact: true })).toHaveCount(0);
+        await expect(page.getByText('Alice (Real Name)', { exact: true })).toHaveCount(0);
+
+        await page.getByRole('button', { name: '预览 已删除的测试好友（66666） 聊天记录' }).click();
+        await expect(page.getByText('这条消息来自非好友会话', { exact: true })).toBeVisible({ timeout: 10_000 });
+        await page.keyboard.press('Escape');
+        await expect(page.getByText('这条消息来自非好友会话', { exact: true })).toHaveCount(0);
+
+        await page.getByRole('button', { name: '预览 已经退出的测试群（888000） 聊天记录' }).click();
+        await expect(page.getByText('旧群里的最后一条消息', { exact: true })).toBeVisible({ timeout: 10_000 });
+        await page.keyboard.press('Escape');
+
+        await page.getByRole('button', { name: '导出 已经退出的测试群 聊天记录' }).click();
+        await expect(page.getByRole('heading', { name: '创建导出任务', level: 1 })).toBeVisible({ timeout: 10_000 });
+        await expect(page.locator('#sessionName')).toHaveValue('已经退出的测试群');
+    });
+
+    test('direct inactive route supports filtering and searching', async ({ page }) => {
+        await authenticate(page);
+        const response = await page.goto(`${FRONTEND_BASE}/qce/inactive/`).catch(() => null);
+        test.skip(!response || response.status() >= 500, `frontend not reachable at ${FRONTEND_BASE}`);
+
+        const search = page.getByPlaceholder('搜索名称、QQ号或群号...');
+        await expect(search).toBeVisible({ timeout: 15_000 });
+        await search.fill('66666');
+        await expect(page.getByText('已删除的测试好友（66666）', { exact: true })).toBeVisible();
+        await expect(page.getByText('已经退出的测试群（888000）', { exact: true })).toHaveCount(0);
+
+        await search.fill('');
+        await page.getByRole('button', { name: '全部 (2)' }).click();
+        await page.getByRole('menuitem', { name: /已退出 \/ 不可用群 \(1\)/ }).click();
+        await expect(page.getByText('已经退出的测试群（888000）', { exact: true })).toBeVisible();
+        await expect(page.getByText('已删除的测试好友（66666）', { exact: true })).toHaveCount(0);
+    });
+
+    test('uploads a backup, previews its history and exports with the import id', async ({ page }) => {
+        await authenticate(page);
+        let imported = false;
+        let detectBody: string | null = null;
+        let uploadBody: string | null = null;
+        let previewBody: Record<string, any> | null = null;
+        let exportBody: Record<string, any> | null = null;
+        let inactiveRefreshes = 0;
+        const backup = {
+            id: 'backupfixture01',
+            fileName: 'nt_msg_export.db',
+            format: 'nt_msg_export',
+            createdAt: '2026-08-05T00:00:00Z',
+            fileSize: 4096,
+            sessionCount: 2,
+            messageCount: 3,
+        };
+        const sessions = [
+            {
+                importId: backup.id,
+                sourceName: backup.fileName,
+                format: backup.format,
+                chatType: 1,
+                peerUid: 'u_backup_deleted',
+                peerUin: '45678',
+                name: '备份中的已删除好友',
+                avatarUrl: '',
+                lastMsgTime: '2026-08-04T12:00:00Z',
+                messageCount: 2,
+            },
+            {
+                importId: backup.id,
+                sourceName: backup.fileName,
+                format: backup.format,
+                chatType: 2,
+                peerUid: '87654',
+                peerUin: '87654',
+                name: '备份中的已退出群',
+                avatarUrl: '',
+                lastMsgTime: '2026-08-04T13:00:00Z',
+                messageCount: 1,
+            },
+        ];
+        const inactiveSessions = sessions.map((session) => ({
+            kind: session.chatType === 2 ? 'unavailable_group' : 'non_friend',
+            chatType: session.chatType,
+            peerUid: session.peerUid,
+            peerUin: session.peerUin,
+            name: session.name,
+            avatarUrl: session.avatarUrl,
+            lastMsgTime: session.lastMsgTime,
+            messageCount: session.messageCount,
+            backupImportId: session.importId,
+            sourceName: session.sourceName,
+        }));
+
+        await page.route('**/api/inactive-sessions**', async (route) => {
+            inactiveRefreshes += 1;
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({
+                    success: true,
+                    data: {
+                        sessions: imported ? inactiveSessions : [],
+                        totalCount: imported ? 2 : 0,
+                        nonFriendCount: imported ? 1 : 0,
+                        unavailableGroupCount: imported ? 1 : 0,
+                        rawCount: 0,
+                        databaseRawCount: imported ? 2 : 0,
+                        indexSource: 'full',
+                        source: imported ? 'database' : 'full',
+                    },
+                }),
+            });
+        });
+        await page.route('**/api/chat-backups**', async (route, request) => {
+            const url = new URL(request.url());
+            if (request.method() === 'POST' && url.pathname.endsWith('/detect-key')) {
+                detectBody = request.postData();
+                await route.fulfill({
+                    status: 200,
+                    contentType: 'application/json',
+                    body: JSON.stringify({
+                        success: true,
+                        data: {
+                            required: true,
+                            detected: true,
+                            key: 'auto-detected-key',
+                            source: 'qq_memory',
+                        },
+                    }),
+                });
+                return;
+            }
+            if (request.method() === 'POST' && url.pathname.endsWith('/upload')) {
+                uploadBody = request.postData();
+                imported = true;
+                await route.fulfill({
+                    status: 200,
+                    contentType: 'application/json',
+                    body: JSON.stringify({ success: true, data: { import: backup } }),
+                });
+                return;
+            }
+            if (request.method() === 'GET' && url.pathname.endsWith('/sessions')) {
+                await route.fulfill({
+                    status: 200,
+                    contentType: 'application/json',
+                    body: JSON.stringify({ success: true, data: { sessions: imported ? sessions : [] } }),
+                });
+                return;
+            }
+            if (request.method() === 'GET' && url.pathname.endsWith('/api/chat-backups')) {
+                await route.fulfill({
+                    status: 200,
+                    contentType: 'application/json',
+                    body: JSON.stringify({ success: true, data: { imports: imported ? [backup] : [] } }),
+                });
+                return;
+            }
+            await route.continue();
+        });
+        await page.route('**/api/messages/fetch', async (route, request) => {
+            previewBody = request.postDataJSON();
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({
+                    success: true,
+                    data: {
+                        messages: [{
+                            msgId: '1', msgSeq: '1', msgTime: '1722772800', chatType: 1,
+                            senderUid: 'u_sender', senderUin: '10001', peerUid: 'u_backup_deleted',
+                            peerUin: '45678', sendType: 0, msgType: 2, subMsgType: 1,
+                            sendNickName: '旧联系人', sendMemberName: '',
+                            elements: [
+                                { elementType: 1, textElement: { content: '来自备份数据库的历史消息' } },
+                                {
+                                    elementType: 16,
+                                    multiForwardMsgElement: {
+                                        resId: '',
+                                        xmlContent: JSON.stringify({
+                                            app: 'com.tencent.gamecenter.mall',
+                                            prompt: '活动卡片',
+                                            url: 'https://example.com/card',
+                                        }),
+                                    },
+                                },
+                            ],
+                        }],
+                        totalCount: 1, currentPage: 1, totalPages: 1, hasNext: false,
+                    },
+                }),
+            });
+        });
+        await page.route('**/api/messages/export', async (route, request) => {
+            exportBody = request.postDataJSON();
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({ success: true, data: { taskId: 'backup-export-task' } }),
+            });
+        });
+
+        const response = await page.goto(`${FRONTEND_BASE}/qce/inactive/`).catch(() => null);
+        test.skip(!response || response.status() >= 500, `frontend not reachable at ${FRONTEND_BASE}`);
+
+        await expect(page.getByText('导入的聊天记录备份')).toBeVisible({ timeout: 15_000 });
+        await page.getByRole('button', { name: '导入备份' }).click();
+        await page.locator('input[type="file"]').setInputFiles({
+            name: 'nt_msg.db',
+            mimeType: 'application/octet-stream',
+            buffer: Buffer.from('encrypted-ntqq-fixture'),
+        });
+        const keyInput = page.getByPlaceholder('NTQQ 数据库密钥（明文导出库可留空）');
+        await expect(keyInput).toHaveValue('auto-detected-key');
+        await expect(page.getByText('已从本机登录中的 QQ 自动检测并填入数据库密钥。')).toBeVisible();
+        await keyInput.fill('manual-override-key');
+        await expect(keyInput).toHaveValue('manual-override-key');
+        await page.getByRole('button', { name: '自动检测' }).click();
+        await expect(keyInput).toHaveValue('auto-detected-key');
+        await page.getByRole('button', { name: '开始导入' }).click();
+
+        await expect.poll(() => detectBody).toContain('nt_msg.db');
+        await expect.poll(() => detectBody).toContain('originalSize');
+        await expect.poll(() => uploadBody).toContain('auto-detected-key');
+        await expect.poll(() => uploadBody).toContain('nt_msg.db');
+        await expect.poll(() => inactiveRefreshes).toBeGreaterThanOrEqual(2);
+        await expect(page.getByText('已合并导入数据库中的 2 个历史会话，并排除仍在当前好友或群列表中的对象。')).toBeVisible();
+        await expect(page.getByText('备份中的已删除好友（45678）', { exact: true })).toHaveCount(1);
+        await expect(page.getByText('u_backup_deleted', { exact: true })).toHaveCount(0);
+        await expect(page.getByText('备份中的已退出群（87654）', { exact: true })).toHaveCount(1);
+
+        const sessionButtons = page.getByRole('button', { name: /^预览 备份中的/ });
+        await expect(sessionButtons).toHaveCount(2);
+        await expect(sessionButtons.nth(0)).toHaveAttribute('aria-label', '预览 备份中的已退出群（87654） 聊天记录');
+
+        await page.getByRole('button', { name: '按最后消息时间' }).click();
+        await page.getByRole('menuitem', { name: '按聊天记录条数' }).click();
+        await expect(sessionButtons.nth(0)).toHaveAttribute('aria-label', '预览 备份中的已删除好友（45678） 聊天记录');
+
+        const backupSearch = page.getByPlaceholder('搜索名称、QQ号或群号...');
+        await backupSearch.fill('45678');
+        await expect(page.getByText('备份中的已删除好友（45678）', { exact: true })).toBeVisible();
+        await expect(page.getByText('备份中的已退出群（87654）', { exact: true })).toHaveCount(0);
+        await backupSearch.fill('');
+
+        const privateSession = page.getByRole('button', { name: '预览 备份中的已删除好友（45678） 聊天记录' });
+        await privateSession.click();
+        await expect(page.getByText('来自备份数据库的历史消息', { exact: true })).toBeVisible();
+        await expect(page.getByText(/^2024 \d{2}-\d{2} \d{2}:\d{2}$/)).toBeVisible();
+        await expect(page.getByRole('link', { name: '活动卡片' })).toHaveAttribute('href', 'https://example.com/card');
+        await expect(page.getByText('[合并转发]', { exact: true })).toHaveCount(0);
+        await expect.poll(() => previewBody?.peer).toEqual({
+            chatType: 1,
+            peerUid: 'u_backup_deleted',
+            backupImportId: backup.id,
+        });
+        await page.keyboard.press('Escape');
+
+        await page.getByRole('button', { name: '导出 备份中的已退出群 聊天记录' }).click();
+        await expect(page.getByRole('heading', { name: '创建导出任务', level: 1 })).toBeVisible();
+        await expect(page.locator('#sessionName')).toHaveValue('备份中的已退出群');
+        await page.getByRole('button', { name: 'QCE Archive', exact: true }).click();
+        await expect(page.getByText(/\.qcearchive/)).toBeVisible();
+        await page.getByRole('button', { name: '创建任务', exact: true }).click();
+        await expect.poll(() => exportBody?.peer).toEqual({
+            chatType: 2,
+            peerUid: '87654',
+            backupImportId: backup.id,
+            peerUin: '87654',
+            guildId: '',
+        });
+        await expect.poll(() => exportBody?.format).toBe('QCEARCHIVE');
+    });
+});
+
 test.describe('Sticker exports', () => {
     test('exporting keeps the loaded sticker list visible', async ({ page }) => {
         await clearLocalStorage(page);
@@ -644,6 +939,7 @@ test.describe('Standalone mode (issue #340)', () => {
 
         const sessionsTab = page.getByRole('button', { name: '会话', exact: true });
         await expect(sessionsTab).toBeVisible({ timeout: 15_000 });
+        await expect(page.getByRole('button', { name: '已删除/退出', exact: true })).toHaveCount(0);
         await sessionsTab.click();
 
         // 引导卡片可见。

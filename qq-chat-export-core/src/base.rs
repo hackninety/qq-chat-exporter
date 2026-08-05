@@ -1,7 +1,7 @@
 use crate::error::{ExportError, ExportResultT};
 use crate::types::{
-    CancellationToken, CleanMessage, ExportFormat, ExportOptions, ExportProgress,
-    ProgressCallback, TimeFormat,
+    CancellationToken, CleanMessage, ExportFormat, ExportOptions, ExportProgress, ProgressCallback,
+    TimeFormat,
 };
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike, Utc};
 use std::collections::HashSet;

@@ -88,7 +88,9 @@ interface GroupApi {
 interface UserApi {
     getUserDetailInfo(uid: string, noCache?: boolean): Promise<{ uid: string; uin?: string; nick: string; longNick?: string }>;
     getUidByUinV2(uin: string): Promise<string>;
-    getRecentContactListSnapShot(): Promise<unknown[]>;
+    getRecentContactListSnapShot(count?: number): Promise<unknown>;
+    getRecentContactListSync(): Promise<unknown[]>;
+    getRecentContactList(): Promise<unknown[]>;
 }
 
 interface FriendApi {
@@ -145,6 +147,29 @@ export function createMockCore(config: MockConfig = {}): MockNapCatCore {
         const ta = Number(a.msgTime ?? 0);
         const tb = Number(b.msgTime ?? 0);
         return tb - ta;
+    }
+
+    function recentContacts(): unknown[] {
+        return conversations
+            // 77777 专门保留为“全量会话索引也遗漏、只能按 QQ 号反查”的回归夹具。
+            .filter((conversation) => conversation.peer.peerUid !== 'u_deactivated_77777')
+            .map((conversation) => {
+                const latest = [...conversation.messages].sort(sortByTimeDesc)[0];
+                const peerUid = conversation.peer.peerUid;
+                const activeFriend = friends.find((friend) => friend.uid === peerUid);
+                const peerMessage = conversation.messages.find((message) => message.senderUid === peerUid);
+                const peerUin = activeFriend?.uin ?? String(peerMessage?.senderUin ?? '');
+                return {
+                    chatType: conversation.peer.chatType,
+                    peerUid,
+                    peerUin: conversation.peer.chatType === 1 ? peerUin : '',
+                    peerName: conversation.chatInfo?.name ?? '',
+                    msgId: latest?.msgId ?? '',
+                    msgTime: latest?.msgTime ?? '0',
+                    sendNickName: peerMessage?.sendNickName ?? ''
+                };
+            })
+            .sort((left, right) => Number(right.msgTime) - Number(left.msgTime));
     }
 
     const logger: Logger = {
@@ -256,9 +281,17 @@ export function createMockCore(config: MockConfig = {}): MockNapCatCore {
             // 未登记的 uin 与生产语义保持一致：返回 undefined，让 lookup 落到 found=false。
             return undefined as unknown as string;
         },
-        async getRecentContactListSnapShot() {
-            track('UserApi.getRecentContactListSnapShot', []);
-            return [];
+        async getRecentContactListSnapShot(count = 100) {
+            track('UserApi.getRecentContactListSnapShot', [count]);
+            return { info: { errCode: 0, changedList: recentContacts().slice(0, count) } };
+        },
+        async getRecentContactListSync() {
+            track('UserApi.getRecentContactListSync', []);
+            return recentContacts();
+        },
+        async getRecentContactList() {
+            track('UserApi.getRecentContactList', []);
+            return recentContacts();
         }
     };
 

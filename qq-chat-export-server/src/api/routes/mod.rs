@@ -1,4 +1,5 @@
 pub mod albums;
+pub mod backup_imports;
 pub mod files;
 pub mod friends;
 pub mod group_files;

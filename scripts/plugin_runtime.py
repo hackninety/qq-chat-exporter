@@ -11,12 +11,14 @@ import stat
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import unquote, urlsplit
 from urllib.request import Request, urlopen
 
 
 SERVER_DIR = Path("qq-chat-export-server")
 
 NAPCAT_LATEST_API = "https://api.github.com/repos/NapNeko/NapCatQQ/releases/latest"
+NAPCAT_LATEST_PAGE = "https://github.com/NapNeko/NapCatQQ/releases/latest"
 
 
 def _rate_limit_hint(headers) -> str:
@@ -30,13 +32,35 @@ def _rate_limit_hint(headers) -> str:
     )
 
 
+def _get_napcat_latest_version_from_page() -> str:
+    """Resolve the current tag through GitHub's non-API latest-release redirect."""
+    request = Request(NAPCAT_LATEST_PAGE, headers={"User-Agent": "qce-packaging"})
+    with urlopen(request, timeout=30) as response:
+        final_url = urlsplit(response.geturl())
+
+    tag_prefix = "/NapNeko/NapCatQQ/releases/tag/"
+    if (
+        final_url.scheme != "https"
+        or final_url.netloc.lower() != "github.com"
+        or not final_url.path.startswith(tag_prefix)
+    ):
+        raise ValueError(f"unexpected latest-release redirect: {final_url.geturl()}")
+
+    version = unquote(final_url.path.removeprefix(tag_prefix)).strip("/")
+    if not version or "/" in version:
+        raise ValueError(f"invalid NapCat tag in redirect: {version!r}")
+    return version
+
+
 def get_napcat_latest_version(progress: str = "[*]") -> str:
     """Resolve which NapCat release to bundle.
 
     NAPCAT_VERSION wins when set, so one CI lookup can feed every packaging job
     and all platforms in a release are guaranteed to bundle the same NapCat.
 
-    There is deliberately no hardcoded fallback. A stale NapCat still builds,
+    There is deliberately no hardcoded fallback. If the GitHub API quota is
+    exhausted locally, the official latest-release page redirect provides the
+    current tag without consuming API quota. A stale NapCat still builds,
     still passes every packaging check and still ships -- but cannot log in at
     all: v6.1.9's macOS package fell back to NapCat v4.8.119 this way after the
     lookup hit the 60/hour unauthenticated rate limit, and QQ's native bridge
@@ -69,10 +93,20 @@ def get_napcat_latest_version(progress: str = "[*]") -> str:
             return version
         except HTTPError as error:
             # A 4xx will not change on a retry. Rate limiting in particular
-            # resets hourly, so report when it lifts rather than retry blindly.
+            # resets hourly, so use GitHub's official latest-release redirect
+            # rather than retrying the same API request blindly.
             if error.code < 500:
                 if error.code in (403, 429):
                     print(_rate_limit_hint(error.headers))
+                    try:
+                        version = _get_napcat_latest_version_from_page()
+                    except (HTTPError, URLError, TimeoutError, ValueError) as fallback_error:
+                        raise SystemExit(
+                            "NapCat version lookup failed: "
+                            f"API HTTP {error.code}; latest-page fallback: {fallback_error}"
+                        ) from fallback_error
+                    print(f"[x] Detected NapCat version from latest-release page: {version}")
+                    return version
                 raise SystemExit(f"NapCat version lookup failed: HTTP {error.code}")
             reason = f"HTTP {error.code}"
         except (URLError, TimeoutError, ValueError, KeyError) as error:

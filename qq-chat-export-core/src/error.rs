@@ -26,6 +26,14 @@ pub enum ExportError {
     #[error("Excel 生成失败: {0}")]
     Xlsx(#[from] rust_xlsxwriter::XlsxError),
 
+    /// QCE Archive 内部 SQLite 数据库生成失败。
+    #[error("SQLite 生成失败: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+
+    /// QCE Archive 封装或格式生成失败。
+    #[error("QCE Archive 生成失败: {0}")]
+    Archive(String),
+
     /// 导出被调用方取消。
     #[error("导出已取消")]
     Cancelled,

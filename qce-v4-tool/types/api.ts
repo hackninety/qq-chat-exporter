@@ -143,6 +143,70 @@ export interface RecentContactsResponse {
   rawCount: number
 }
 
+/** 当前已不在好友或群列表、但 NTQQ 本机仍保留索引的历史会话。 */
+export interface InactiveSession {
+  kind: 'non_friend' | 'unavailable_group'
+  chatType: 1 | 2
+  peerUid: string
+  peerUin?: string
+  name: string
+  avatarUrl?: string
+  lastMsgTime?: string
+  backupImportId?: string
+  sourceName?: string
+  messageCount?: number
+}
+
+export interface InactiveSessionsResponse {
+  sessions: InactiveSession[]
+  totalCount: number
+  nonFriendCount: number
+  unavailableGroupCount: number
+  rawCount: number
+  databaseRawCount?: number
+  indexSource?: 'full' | 'snapshot'
+  source: 'database' | 'full' | 'snapshot'
+}
+
+export interface ChatBackupImport {
+  id: string
+  fileName: string
+  format: 'nt_msg_export' | 'nt_msg_raw'
+  createdAt: string
+  fileSize: number
+  sessionCount: number
+  messageCount: number
+}
+
+export interface ImportedChatSession {
+  importId: string
+  sourceName: string
+  format: 'nt_msg_export' | 'nt_msg_raw'
+  chatType: 1 | 2
+  peerUid: string
+  peerUin?: string
+  name: string
+  avatarUrl: string
+  lastMsgTime?: string
+  messageCount: number
+}
+
+export interface ChatBackupsResponse {
+  imports: ChatBackupImport[]
+}
+
+export interface ChatBackupKeyDetection {
+  required: boolean
+  detected: boolean
+  key?: string
+  source?: 'qq_memory'
+}
+
+export interface ImportedChatSessionsResponse {
+  sessions: ImportedChatSession[]
+  totalCount: number
+}
+
 // Task Types
 export interface ExportTask {
   id: string
@@ -204,6 +268,8 @@ export interface ExportResourceSummary {
 export interface CreateTaskForm {
   chatType: number
   peerUid: string
+  /** 从 QCE 聊天记录备份库读取，而不是调用当前 QQ/NapCat 会话。 */
+  backupImportId?: string
   /** 已知 QQ 号；用于生成可读文件名，避免后端重复查询。 */
   peerUin?: string
   sessionName: string
@@ -248,6 +314,7 @@ export interface CreateTaskRequest {
     chatType: number
     peerUid: string
     peerUin?: string
+    backupImportId?: string
     guildId: string
   }
   sessionName?: string

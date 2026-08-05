@@ -6,6 +6,7 @@ use std::time::Instant;
 use serde_json::Value;
 use tokio::sync::{broadcast, Mutex};
 
+use crate::backup_import::BackupImportManager;
 use crate::napcat::NapCatBridgeClient;
 use crate::paths::PathManager;
 use crate::progress::ProgressTracker;
@@ -35,6 +36,8 @@ pub type WsMessage = String;
 pub struct AppState {
     /// NapCat bridge 客户端。
     pub napcat: NapCatBridgeClient,
+    /// 聊天记录备份只读导入管理器。
+    pub backup_import_manager: Arc<BackupImportManager>,
     /// 数据库管理器。
     pub db: Arc<DatabaseManager>,
     /// 全局资源处理器。
