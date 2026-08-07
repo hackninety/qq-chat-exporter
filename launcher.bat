@@ -7,8 +7,19 @@ title QQ Chat Exporter Launcher
 
 if not defined QCE_PACKAGE_DIR set "QCE_PACKAGE_DIR=%~dp0NapCat-QCE-Windows-x64"
 set "QCE_PACKAGE_LAUNCHER=%QCE_PACKAGE_DIR%\launcher.bat"
+set "QCE_PACKAGE_BUILD_STAMP=%QCE_PACKAGE_DIR%\.qce-build-stamp"
+set "QCE_QUICK_LOGIN_FILE=%USERPROFILE%\.qq-chat-exporter\qq-login.json"
+set "QCE_QUICK_LOGIN_DISABLED_FILE=%USERPROFILE%\.qq-chat-exporter\qq-login.disabled"
+
+call :restore_quick_login_account
 
 if "%QCE_REBUILD%"=="1" goto :build_package
+if exist "%QCE_PACKAGE_LAUNCHER%" call :detect_stale_package
+if "%QCE_SERVER_SOURCE_STALE%"=="1" set "QCE_REBUILD_SERVER=1"
+if "%QCE_PACKAGE_STALE%"=="1" (
+    echo [QCE] Source changes detected. Rebuilding the Windows runtime package...
+    goto :build_package
+)
 if exist "%QCE_PACKAGE_LAUNCHER%" (
     if "%QCE_BUILD_ONLY%"=="1" (
         echo [QCE] Windows runtime package is ready.
@@ -122,12 +133,32 @@ if not exist "%QCE_PACKAGE_LAUNCHER%" (
     goto :failed
 )
 
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; [IO.File]::WriteAllText($env:QCE_PACKAGE_BUILD_STAMP, [DateTime]::UtcNow.ToString('o'), [Text.UTF8Encoding]::new($false))"
+if errorlevel 1 (
+    echo [Error] Failed to record the Windows runtime package build timestamp.
+    goto :failed
+)
+
 if "%QCE_BUILD_ONLY%"=="1" (
     echo [QCE] Windows runtime package is ready.
     exit /b 0
 )
 
 :launch_package
+if not defined NAPCAT_QUICK_ACCOUNT goto :launch_without_quick_login
+echo [QCE] Reusing the local QQ login for account %NAPCAT_QUICK_ACCOUNT%.
+if not "%~1"=="" goto :launch_with_quick_login
+if not exist "%QCE_PACKAGE_DIR%\config\qq_path.txt" goto :launch_with_quick_login
+set /p "QCE_SAVED_QQ_PATH="<"%QCE_PACKAGE_DIR%\config\qq_path.txt"
+if not exist "%QCE_SAVED_QQ_PATH%" goto :launch_with_quick_login
+call "%QCE_PACKAGE_LAUNCHER%" "%QCE_SAVED_QQ_PATH%" -q "%NAPCAT_QUICK_ACCOUNT%"
+exit /b %errorlevel%
+
+:launch_with_quick_login
+call "%QCE_PACKAGE_LAUNCHER%" %* -q "%NAPCAT_QUICK_ACCOUNT%"
+exit /b %errorlevel%
+
+:launch_without_quick_login
 echo [QCE] Starting "%QCE_PACKAGE_LAUNCHER%"...
 call "%QCE_PACKAGE_LAUNCHER%" %*
 exit /b %errorlevel%
@@ -136,3 +167,27 @@ exit /b %errorlevel%
 echo.
 pause
 exit /b 1
+
+:restore_quick_login_account
+if defined NAPCAT_QUICK_ACCOUNT exit /b 0
+if exist "%QCE_QUICK_LOGIN_FILE%" (
+    for /f "usebackq delims=" %%i in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='SilentlyContinue'; $uin=(Get-Content -Raw -LiteralPath $env:QCE_QUICK_LOGIN_FILE | ConvertFrom-Json).uin; if ($uin -match '^\d{5,12}$') { $uin }"`) do set "NAPCAT_QUICK_ACCOUNT=%%i"
+)
+if defined NAPCAT_QUICK_ACCOUNT exit /b 0
+if exist "%QCE_QUICK_LOGIN_DISABLED_FILE%" exit /b 0
+
+rem One-time migration for packages created before qq-login.json existed.
+if exist "%QCE_PACKAGE_DIR%\config" (
+    set "QCE_PACKAGE_CONFIG=%QCE_PACKAGE_DIR%\config"
+    for /f "usebackq delims=" %%i in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='SilentlyContinue'; Get-ChildItem -LiteralPath $env:QCE_PACKAGE_CONFIG -Filter 'napcat_*.json' -File | Sort-Object LastWriteTimeUtc -Descending | ForEach-Object { if ($_.BaseName -match '^napcat_(\d{5,12})$') { $Matches[1]; break } }"`) do set "NAPCAT_QUICK_ACCOUNT=%%i"
+)
+if defined NAPCAT_QUICK_ACCOUNT powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='SilentlyContinue'; $parent=Split-Path -Parent $env:QCE_QUICK_LOGIN_FILE; New-Item -ItemType Directory -Force -Path $parent | Out-Null; [IO.File]::WriteAllText($env:QCE_QUICK_LOGIN_FILE, (@{schemaVersion=1;uin=$env:NAPCAT_QUICK_ACCOUNT;updatedAt=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json), [Text.UTF8Encoding]::new($false))"
+exit /b 0
+
+:detect_stale_package
+set "QCE_PACKAGE_STALE=0"
+set "QCE_SERVER_SOURCE_STALE=0"
+if "%QCE_SKIP_AUTO_REBUILD%"=="1" exit /b 0
+set "QCE_REPO_ROOT=%~dp0"
+for /f "usebackq tokens=1,2 delims==" %%a in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $root=$env:QCE_REPO_ROOT; function Newer([string]$output,[string[]]$inputs) { if (-not (Test-Path -LiteralPath $output)) { return $true }; $stamp=(Get-Item -LiteralPath $output).LastWriteTimeUtc.AddSeconds(2); foreach ($input in $inputs) { if (-not (Test-Path -LiteralPath $input)) { continue }; $item=Get-Item -LiteralPath $input; if (-not $item.PSIsContainer) { if ($item.LastWriteTimeUtc -gt $stamp) { return $true }; continue }; if (Get-ChildItem -LiteralPath $input -Recurse -File | Where-Object LastWriteTimeUtc -gt $stamp | Select-Object -First 1) { return $true } }; return $false }; $frontend=@('qce-v4-tool\app','qce-v4-tool\components','qce-v4-tool\hooks','qce-v4-tool\lib','qce-v4-tool\public','qce-v4-tool\types','qce-v4-tool\package.json','qce-v4-tool\pnpm-lock.yaml','qce-v4-tool\next.config.mjs') | ForEach-Object { Join-Path $root $_ }; $plugin=@('plugins\qq-chat-exporter\index.mjs','plugins\qq-chat-exporter\runtime','plugins\qq-chat-exporter\package.json','scripts\quick-pack.py','scripts\plugin_runtime.py') | ForEach-Object { Join-Path $root $_ }; $server=@('qq-chat-export-server\src','qq-chat-export-server\Cargo.toml','qq-chat-export-server\Cargo.lock','qq-chat-export-core\src','qq-chat-export-core\Cargo.toml') | ForEach-Object { Join-Path $root $_ }; $localServer=Join-Path $root 'qq-chat-export-server\target\release\qce-server.exe'; $sourceStale=Newer $localServer $server; $packageStale=Newer $env:QCE_PACKAGE_BUILD_STAMP ($frontend + $plugin + $server + @($localServer)); 'QCE_PACKAGE_STALE=' + [int]$packageStale; 'QCE_SERVER_SOURCE_STALE=' + [int]$sourceStale"`) do set "%%a=%%b"
+exit /b 0

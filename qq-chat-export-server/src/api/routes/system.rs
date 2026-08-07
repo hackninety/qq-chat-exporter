@@ -1,3 +1,7 @@
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use axum::extract::{Extension, State};
 use axum::response::Response;
 use axum::Json;
@@ -5,10 +9,89 @@ use serde_json::{json, Value};
 
 use crate::api::response::{self, ApiError, ErrorType, RequestId};
 use crate::api::state::SharedState;
+use crate::napcat::NapCatBridgeClient;
 use crate::paths::PathManager;
 use crate::version::{APP_COPYRIGHT, APP_NAME, VERSION};
 
 const MAX_CONFIG_PATH_LENGTH: usize = 4096;
+const QQ_LOGIN_FILE_NAME: &str = "qq-login.json";
+const QQ_LOGIN_DISABLED_FILE_NAME: &str = "qq-login.disabled";
+
+fn quick_login_path(base_dir: &Path) -> PathBuf {
+    base_dir.join(QQ_LOGIN_FILE_NAME)
+}
+
+fn quick_login_disabled_path(base_dir: &Path) -> PathBuf {
+    base_dir.join(QQ_LOGIN_DISABLED_FILE_NAME)
+}
+
+fn login_uin(self_info: &Value) -> Option<String> {
+    let uin = self_info
+        .get("uin")
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .or_else(|| value.as_u64().map(|number| number.to_string()))
+        })?
+        .trim()
+        .to_string();
+    (uin.len() >= 5 && uin.len() <= 12 && uin.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some(uin)
+}
+
+async fn save_quick_login_account(base_dir: &Path, self_info: &Value) -> io::Result<bool> {
+    let Some(uin) = login_uin(self_info) else {
+        return Ok(false);
+    };
+    tokio::fs::create_dir_all(base_dir).await?;
+    let payload = serde_json::to_vec_pretty(&json!({
+        "schemaVersion": 1,
+        "uin": uin,
+        "updatedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    }))?;
+    let path = quick_login_path(base_dir);
+    tokio::fs::write(&path, payload).await?;
+    match tokio::fs::remove_file(quick_login_disabled_path(base_dir)).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    Ok(true)
+}
+
+async fn remove_quick_login_account(base_dir: &Path) -> io::Result<bool> {
+    let removed = match tokio::fs::remove_file(quick_login_path(base_dir)).await {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }?;
+    tokio::fs::create_dir_all(base_dir).await?;
+    tokio::fs::write(
+        quick_login_disabled_path(base_dir),
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    )
+    .await?;
+    Ok(removed)
+}
+
+/// 记录最近一次成功登录的 QQ 号。真实登录凭据仍由 QQNT 自己保管；启动器只把
+/// 这个账号选择传给 NapCat 的 `-q`/快速登录流程，凭据失效时会自然回退二维码。
+pub async fn remember_quick_login_account(
+    path_manager: &PathManager,
+    napcat: &NapCatBridgeClient,
+) -> io::Result<bool> {
+    let self_info = tokio::time::timeout(Duration::from_secs(5), napcat.self_info())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "读取当前 QQ 账号超时"))?
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    save_quick_login_account(path_manager.default_base_dir().as_path(), &self_info).await
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum ConfigPathUpdate {
@@ -166,6 +249,11 @@ pub async fn system_info(
                 Some(format!("https://q1.qlogo.cn/g?b=qq&nk={uin}&s=640"))
             }
         });
+    let quick_login_enabled = tokio::fs::try_exists(quick_login_path(
+        state.path_manager.default_base_dir().as_path(),
+    ))
+    .await
+    .unwrap_or(false);
 
     response::success(
         json!({
@@ -193,6 +281,11 @@ pub async fn system_info(
                     "vipLevel": self_info.get("vipLevel").and_then(Value::as_i64).unwrap_or(0)
                 }
             },
+            "quickLogin": {
+                "enabled": quick_login_enabled,
+                "account": if quick_login_enabled { uin } else { "" },
+                "credentialOwner": "qqnt"
+            },
             "runtime": {
                 "nodeVersion": format!("rust-{}", env!("CARGO_PKG_VERSION")),
                 "platform": std::env::consts::OS,
@@ -203,6 +296,35 @@ pub async fn system_info(
         }),
         &request_id,
     )
+}
+
+/// `POST /api/system/logout` — 清除 QCE 的本地自动登录账号记录。
+///
+/// 当前 QQNT 进程已经持有本次登录会话，不能在不破坏 QQ 用户数据的前提下从
+/// QCE 强行抹除它；清除后关闭本程序，下次启动会回到二维码登录。
+pub async fn logout_account(
+    State(state): State<SharedState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+) -> Response {
+    match remove_quick_login_account(state.path_manager.default_base_dir().as_path()).await {
+        Ok(removed) => response::success(
+            json!({
+                "removed": removed,
+                "currentSessionActive": true,
+                "requiresRestart": true,
+                "message": "已清除本地自动登录记录；关闭当前程序后，下次启动将显示二维码。"
+            }),
+            &request_id,
+        ),
+        Err(error) => {
+            let err = ApiError::new(
+                ErrorType::FileSystem,
+                format!("清除本地自动登录记录失败: {error}"),
+                "CLEAR_QQ_LOGIN_FAILED",
+            );
+            response::error(&err, &request_id)
+        }
+    }
 }
 
 /// `GET /api/system/status` — 系统状态。
@@ -428,7 +550,10 @@ pub async fn put_config(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_config_path, ConfigPathUpdate};
+    use super::{
+        login_uin, parse_config_path, quick_login_disabled_path, quick_login_path,
+        remove_quick_login_account, save_quick_login_account, ConfigPathUpdate,
+    };
     use serde_json::json;
 
     #[test]
@@ -444,5 +569,61 @@ mod tests {
                 .expect("null is valid"),
             ConfigPathUpdate::Clear
         );
+    }
+
+    #[test]
+    fn quick_login_only_accepts_plausible_numeric_uin() {
+        assert_eq!(
+            login_uin(&json!({ "uin": "565122807" })).as_deref(),
+            Some("565122807")
+        );
+        assert_eq!(
+            login_uin(&json!({ "uin": 565_122_807 })).as_deref(),
+            Some("565122807")
+        );
+        assert_eq!(login_uin(&json!({ "uin": "u_invalid" })), None);
+        assert_eq!(login_uin(&json!({ "uin": "1234" })), None);
+    }
+
+    #[tokio::test]
+    async fn quick_login_account_can_be_saved_and_removed() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "qce-quick-login-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+
+        assert!(
+            save_quick_login_account(&base_dir, &json!({ "uin": "565122807" }))
+                .await
+                .expect("save quick login")
+        );
+        let stored: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(quick_login_path(&base_dir))
+                .await
+                .expect("read quick login"),
+        )
+        .expect("parse quick login");
+        assert_eq!(
+            stored.get("uin").and_then(serde_json::Value::as_str),
+            Some("565122807")
+        );
+        assert!(remove_quick_login_account(&base_dir)
+            .await
+            .expect("remove quick login"));
+        assert!(tokio::fs::try_exists(quick_login_disabled_path(&base_dir))
+            .await
+            .expect("check disabled marker"));
+        assert!(!remove_quick_login_account(&base_dir)
+            .await
+            .expect("remove missing quick login"));
+        assert!(
+            save_quick_login_account(&base_dir, &json!({ "uin": "565122807" }))
+                .await
+                .expect("save quick login again")
+        );
+        assert!(!tokio::fs::try_exists(quick_login_disabled_path(&base_dir))
+            .await
+            .expect("check cleared disabled marker"));
+        let _ = tokio::fs::remove_dir_all(base_dir).await;
     }
 }

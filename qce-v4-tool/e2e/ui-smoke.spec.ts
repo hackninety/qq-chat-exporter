@@ -369,6 +369,41 @@ test.describe('Session list — QQ lookup (issue #204)', () => {
     });
 });
 
+test.describe('QQ quick login', () => {
+    test('plugin mode can clear the locally remembered account', async ({ page }) => {
+        await authenticate(page);
+
+        let logoutMethod = '';
+        await page.route('**/api/system/logout', async (route, request) => {
+            logoutMethod = request.method();
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({
+                    success: true,
+                    data: {
+                        removed: true,
+                        currentSessionActive: true,
+                        requiresRestart: true,
+                        message: '已清除本地自动登录记录；关闭当前程序后，下次启动将显示二维码。',
+                    },
+                }),
+            });
+        });
+
+        const response = await page.goto(`${FRONTEND_BASE}/qce/inactive/`).catch(() => null);
+        test.skip(!response || response.status() >= 500, `frontend not reachable at ${FRONTEND_BASE}`);
+
+        const logoutButton = page.getByTestId('logout-qq-account-button');
+        await expect(logoutButton).toBeVisible({ timeout: 15_000 });
+        page.once('dialog', (dialog) => dialog.accept());
+        await logoutButton.click();
+
+        await expect.poll(() => logoutMethod).toBe('POST');
+        await expect(page.getByText('已注销自动登录', { exact: true })).toBeVisible();
+    });
+});
+
 test.describe('Inactive sessions', () => {
     test('sidebar list previews non-friends and unavailable groups, then opens export preset', async ({ page }) => {
         await authenticate(page);
@@ -1025,6 +1060,7 @@ test.describe('Standalone mode (issue #340)', () => {
         await expect(sessionsTab).toBeVisible({ timeout: 15_000 });
         await expect(page.getByRole('button', { name: '已删除/退出', exact: true })).toHaveCount(0);
         await sessionsTab.click();
+        await expect(page.getByTestId('logout-qq-account-button')).toHaveCount(0);
         await expect(page.getByTestId('account-export-button')).toHaveCount(0);
         await expect(page.getByTestId('inactive-account-export-button')).toHaveCount(0);
 

@@ -48,6 +48,11 @@ export interface SystemInfo {
       vipLevel?: number
     }
   }
+  quickLogin?: {
+    enabled: boolean
+    account: string
+    credentialOwner: 'qqnt'
+  }
   runtime: {
     nodeVersion: string
     platform: string
@@ -141,6 +146,13 @@ export interface RecentContactsResponse {
   contacts: RecentContact[]
   totalCount: number
   rawCount: number
+}
+
+export interface AccountLogoutResult {
+  removed: boolean
+  currentSessionActive: boolean
+  requiresRestart: boolean
+  message: string
 }
 
 /** 当前已不在好友或群列表、但 NTQQ 本机仍保留索引的历史会话。 */

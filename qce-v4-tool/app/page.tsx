@@ -87,6 +87,7 @@ import {
   ChevronRight,
   Search,
   Square,
+  LogOut,
 } from "lucide-react"
 import type { CreateTaskForm, CreateScheduledExportForm, InactiveSession } from "@/types/api"
 import { useQCE } from "@/hooks/use-qce"
@@ -232,6 +233,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set())
   const [isBatchExportDialogOpen, setIsBatchExportDialogOpen] = useState(false)
   const [isAccountExportDialogOpen, setIsAccountExportDialogOpen] = useState(false)
+  const [isLoggingOut, setIsLoggingOut] = useState(false)
 
   const {
     data: inactiveSessionsData,
@@ -474,6 +476,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
   const {
     systemInfo,
     refreshSystemInfo,
+    logoutAccount,
     groups,
     friends,
     recentActivityMap,
@@ -494,6 +497,28 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
     isJsonlExport,
     openTaskFileLocation,
   } = useQCE({ onNotification: handleQceNotification })
+
+  const handleLogoutAccount = useCallback(async () => {
+    const confirmed = window.confirm(
+      "确定注销当前账号吗？\n\n这会清除 QCE 保存的本地自动登录记录。关闭当前程序后，下次运行 launcher.bat 将显示二维码。",
+    )
+    if (!confirmed) return
+
+    setIsLoggingOut(true)
+    try {
+      const result = await logoutAccount()
+      toast.success("已注销自动登录", {
+        description: result.message,
+        duration: Number.POSITIVE_INFINITY,
+      })
+    } catch (error) {
+      toast.error("注销失败", {
+        description: error instanceof Error ? error.message : "无法清除本地自动登录记录",
+      })
+    } finally {
+      setIsLoggingOut(false)
+    }
+  }, [logoutAccount])
 
   useEffect(() => {
     const currentVersion = systemInfo?.version || BUILD_VERSION
@@ -1910,6 +1935,20 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                   导出所有
                 </Button>
               </>
+            )}
+            {!isStandalone && systemInfo?.napcat.selfInfo?.uin && (
+              <Button
+                data-testid="logout-qq-account-button"
+                size="sm"
+                variant="ghost"
+                className="h-8 rounded-full px-2.5 text-[13px] text-muted-foreground hover:text-red-600 dark:hover:text-red-400"
+                onClick={handleLogoutAccount}
+                disabled={isLoggingOut}
+                title="清除本地自动登录记录"
+              >
+                {isLoggingOut ? <Loader size={14} /> : <LogOut className="h-3.5 w-3.5" />}
+                <span className="hidden sm:inline">注销</span>
+              </Button>
             )}
           </div>
         </div>

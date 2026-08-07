@@ -56,6 +56,7 @@ export function useQCE(props?: { onNotification?: UseExportTasksProps['onNotific
     // System
     systemInfo: systemInfo.systemInfo,
     refreshSystemInfo: systemInfo.refreshSystemInfo,
+    logoutAccount: systemInfo.logoutAccount,
 
     // WebSocket
     wsConnected: websocket.connected,

@@ -1,5 +1,5 @@
 import { useState, useCallback } from "react"
-import type { SystemInfo } from "@/types/api"
+import type { AccountLogoutResult, SystemInfo } from "@/types/api"
 import { useApi } from "./use-api"
 
 export function useSystemInfo() {
@@ -29,11 +29,30 @@ export function useSystemInfo() {
     loadSystemInfo()
   }, [loadSystemInfo])
 
+  const logoutAccount = useCallback(async () => {
+    const response = await apiCall<AccountLogoutResult>("/api/system/logout", {
+      method: "POST",
+    })
+    if (!response.success || !response.data) {
+      throw new Error(response.error?.message || "注销失败")
+    }
+    setSystemInfo((current) => current ? {
+      ...current,
+      quickLogin: {
+        enabled: false,
+        account: "",
+        credentialOwner: "qqnt",
+      },
+    } : current)
+    return response.data
+  }, [apiCall])
+
   return {
     systemInfo,
     loading,
     error,
     loadSystemInfo,
     refreshSystemInfo,
+    logoutAccount,
   }
 }

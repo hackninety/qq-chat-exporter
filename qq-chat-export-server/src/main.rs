@@ -114,6 +114,11 @@ async fn run() -> Result<(), String> {
     let napcat = NapCatBridgeClient::new(&bridge_endpoint, 120_000)
         .map_err(|e| format!("创建 bridge 客户端失败: {e}"))?;
     tracing::info!("[QCE] NapCat bridge: {bridge_endpoint}");
+    match system::remember_quick_login_account(&path_manager, &napcat).await {
+        Ok(true) => tracing::info!("[QCE] QQ quick-login account remembered"),
+        Ok(false) => tracing::warn!("[QCE] QQ login information did not contain a usable UIN"),
+        Err(error) => tracing::warn!("[QCE] Failed to remember QQ quick-login account: {error}"),
+    }
 
     // 资源处理器
     let resource_handler = Arc::new(
@@ -227,6 +232,7 @@ fn build_router(
         // 系统信息 / 配置。
         .route("/api/system/info", get(system::system_info))
         .route("/api/system/status", get(system::system_status))
+        .route("/api/system/logout", post(system::logout_account))
         .route(
             "/api/config",
             get(system::get_config).put(system::put_config),
