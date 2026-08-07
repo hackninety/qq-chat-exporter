@@ -2187,6 +2187,10 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                       onRefresh={loadChatBackups}
                       onDetectKey={detectChatBackupKey}
                       onImportFile={handleImportChatBackupFile}
+                      onExportAll={() => {
+                        setIsAccountExportDialogOpen(true)
+                        if (!chatBackupsLoaded) void loadChatBackups()
+                      }}
                     />
                   </div>
                 )}

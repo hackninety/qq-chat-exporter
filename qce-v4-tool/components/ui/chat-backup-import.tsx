@@ -3,6 +3,7 @@
 import { useRef, useState } from "react"
 import {
   AlertCircle,
+  Archive,
   CheckCircle2,
   Database,
   FileArchive,
@@ -25,6 +26,7 @@ interface ChatBackupImportProps {
   onRefresh: () => void
   onDetectKey: (file: File) => Promise<ChatBackupKeyDetection>
   onImportFile: (file: File, key?: string) => Promise<ChatBackupImport | null>
+  onExportAll: () => void
 }
 
 function formatSize(bytes: number): string {
@@ -43,6 +45,7 @@ export function ChatBackupImportSection({
   onRefresh,
   onDetectKey,
   onImportFile,
+  onExportAll,
 }: ChatBackupImportProps) {
   const [showImporter, setShowImporter] = useState(false)
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
@@ -235,6 +238,27 @@ export function ChatBackupImportSection({
           ))}
         </div>
       )}
+
+      <div className="flex flex-col gap-3 rounded-2xl bg-black/[0.025] p-4 dark:bg-white/[0.035] sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <p className="text-sm font-medium text-foreground">全账号完整归档</p>
+          <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground/65">
+            以已导入的 nt_msg.db 为历史主源，并补齐当前会话、头像、消息媒体、表情、群文件和群相册，生成可离线检索的 .qcearchive。
+          </p>
+        </div>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          data-testid="inactive-account-export-button"
+          className="h-8 shrink-0 rounded-full px-3 text-[12px]"
+          disabled={loading || importing || imports.length === 0}
+          onClick={onExportAll}
+        >
+          <Archive className="mr-1.5 h-3.5 w-3.5" />
+          导出所有聊天记录
+        </Button>
+      </div>
 
       {loading && imports.length === 0 ? (
         <div className="flex items-center justify-center py-10 text-xs text-muted-foreground">

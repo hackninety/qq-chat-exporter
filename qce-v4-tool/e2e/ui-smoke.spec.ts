@@ -26,8 +26,23 @@ const SHELL_PATH = `/qce`;
 async function clearLocalStorage(page: import('@playwright/test').Page) {
     // We can't use addInitScript here – that runs on EVERY navigation in the
     // page, so it would also wipe a token the auth flow just persisted.
-    await page.goto(`${FRONTEND_BASE}${SHELL_PATH}`).catch(() => null);
+    // Use the auth page as a stable same-origin landing page. Visiting the app
+    // shell without a token starts an asynchronous redirect that can destroy
+    // the execution context while the storage write is running.
+    await page.goto(`${FRONTEND_BASE}${AUTH_PATH}`).catch(() => null);
     await page.evaluate(() => localStorage.clear()).catch(() => null);
+}
+
+async function authenticate(page: import('@playwright/test').Page) {
+    await clearLocalStorage(page);
+    await page.goto(`${FRONTEND_BASE}${AUTH_PATH}?token=${TOKEN}`);
+    await page.waitForURL(
+        (url) => !url.pathname.endsWith('/auth') && !url.pathname.endsWith('/auth/'),
+        { timeout: 15_000 }
+    );
+    await page.evaluate(() => {
+        localStorage.setItem('qce-onboarding-completed', 'true');
+    });
 }
 
 test.describe('Auth flow', () => {
@@ -355,14 +370,6 @@ test.describe('Session list — QQ lookup (issue #204)', () => {
 });
 
 test.describe('Inactive sessions', () => {
-    async function authenticate(page: import('@playwright/test').Page) {
-        await clearLocalStorage(page);
-        await page.evaluate((value) => {
-            localStorage.setItem('qce_access_token', value);
-            localStorage.setItem('qce-onboarding-completed', 'true');
-        }, TOKEN);
-    }
-
     test('sidebar list previews non-friends and unavailable groups, then opens export preset', async ({ page }) => {
         await authenticate(page);
         const response = await page.goto(`${FRONTEND_BASE}${SHELL_PATH}`).catch(() => null);
@@ -636,7 +643,7 @@ test.describe('Inactive sessions', () => {
         await expect(page.getByRole('heading', { name: '创建导出任务', level: 1 })).toBeVisible();
         await expect(page.locator('#sessionName')).toHaveValue('备份中的已退出群');
         await page.getByRole('button', { name: 'QCE Archive', exact: true }).click();
-        await expect(page.getByText(/\.qcearchive/)).toBeVisible();
+        await expect(page.getByRole('dialog').getByText(/生成可供离线工具读取的 \.qcearchive/)).toBeVisible();
         await page.getByRole('button', { name: '创建任务', exact: true }).click();
         await expect.poll(() => exportBody?.peer).toEqual({
             chatType: 2,
@@ -650,12 +657,8 @@ test.describe('Inactive sessions', () => {
 });
 
 test.describe('Account archive exports', () => {
-    test('previews the selected backup and starts an optional debug account export', async ({ page }) => {
-        await clearLocalStorage(page);
-        await page.evaluate((value) => {
-            localStorage.setItem('qce_access_token', value);
-            localStorage.setItem('qce-onboarding-completed', 'true');
-        }, TOKEN);
+    test('starts a debug-enabled full account export from the inactive backup section', async ({ page }) => {
+        await authenticate(page);
 
         const backup = {
             id: 'account-backup-1',
@@ -711,21 +714,21 @@ test.describe('Account archive exports', () => {
             });
         });
 
-        const response = await page.goto(`${FRONTEND_BASE}${SHELL_PATH}`).catch(() => null);
+        const response = await page.goto(`${FRONTEND_BASE}/qce/inactive/`).catch(() => null);
         test.skip(!response || response.status() >= 500, `frontend not reachable at ${FRONTEND_BASE}`);
-        await openSessionsTab(page);
-        await page.getByTestId('account-export-button').click();
+        await expect(page.getByText('导入的聊天记录备份')).toBeVisible({ timeout: 15_000 });
+        await page.getByTestId('inactive-account-export-button').click();
 
         const dialog = page.getByRole('dialog');
-        await expect(dialog.getByRole('heading', { name: '导出整个账号' })).toBeVisible();
+        await expect(dialog.getByRole('heading', { name: '创建导出任务' })).toBeVisible();
         await expect(dialog.locator('select')).toHaveValue(backup.id);
         await expect(dialog.getByText(/历史主源：nt_msg\.sqlite/)).toBeVisible();
         await expect.poll(() => previewBody).toEqual({ backupImportId: backup.id });
         await expect(page.getByText('已删除/非好友', { exact: true })).toBeVisible();
         await expect(page.getByText('已退出/不可用群', { exact: true })).toBeVisible();
+        await expect(dialog.getByRole('checkbox')).toBeChecked();
 
-        await page.getByRole('checkbox').click();
-        await page.getByRole('button', { name: '创建全账号归档', exact: true }).click();
+        await dialog.getByRole('button', { name: '创建导出任务', exact: true }).click();
         await expect.poll(() => createBody).toEqual({ backupImportId: backup.id, debugExport: true });
     });
 });
@@ -1023,6 +1026,7 @@ test.describe('Standalone mode (issue #340)', () => {
         await expect(page.getByRole('button', { name: '已删除/退出', exact: true })).toHaveCount(0);
         await sessionsTab.click();
         await expect(page.getByTestId('account-export-button')).toHaveCount(0);
+        await expect(page.getByTestId('inactive-account-export-button')).toHaveCount(0);
 
         // 引导卡片可见。
         const banner = page.getByTestId('sessions-standalone-banner');

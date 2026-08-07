@@ -36,7 +36,7 @@ export function AccountExportDialog({
   onStarted,
 }: AccountExportDialogProps) {
   const [backupImportId, setBackupImportId] = useState("")
-  const [debugExport, setDebugExport] = useState(false)
+  const [debugExport, setDebugExport] = useState(true)
   const [preview, setPreview] = useState<AccountExportPreview | null>(null)
   const [previewLoading, setPreviewLoading] = useState(false)
   const [creating, setCreating] = useState(false)
@@ -44,6 +44,7 @@ export function AccountExportDialog({
 
   useEffect(() => {
     if (!open) return
+    setDebugExport(true)
     if (!backupImportId || !imports.some((item) => item.id === backupImportId)) {
       setBackupImportId(imports[0]?.id ?? "")
     }
@@ -113,7 +114,7 @@ export function AccountExportDialog({
         <DialogHeader className="border-b px-6 py-5 text-left">
           <DialogTitle className="flex items-center gap-2 text-lg">
             <Archive className="h-5 w-5" />
-            导出整个账号
+            创建导出任务
           </DialogTitle>
           <DialogDescription>
             将历史数据库、当前 QQ 会话和可访问资源合并为可离线检索的 QCE Archive v2。
@@ -190,7 +191,7 @@ export function AccountExportDialog({
             <span className="space-y-1">
               <span className="block text-sm font-medium">同时生成 .debug 旁路目录</span>
               <span className="block text-xs leading-relaxed text-muted-foreground">
-                保存逐会话原始/解析消息、资源事件和缺失摘要。默认关闭，排查数据问题时再开启。
+                保存逐会话原始/解析消息、资源事件和缺失摘要。默认开启，便于未来发现问题时追溯归档来源。
               </span>
             </span>
           </label>
@@ -210,7 +211,7 @@ export function AccountExportDialog({
             disabled={!preview || !backupImportId || creating || previewLoading}
           >
             {creating && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            创建全账号归档
+            创建导出任务
           </Button>
         </div>
       </DialogContent>
