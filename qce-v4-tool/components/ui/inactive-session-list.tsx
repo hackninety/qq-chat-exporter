@@ -37,13 +37,14 @@ interface InactiveSessionListProps {
 }
 
 function sessionDisplayName(session: InactiveSession): string {
-  if (session.kind === 'unavailable_group') {
+  if (session.kind === 'unavailable_group' || session.kind === 'discussion') {
     const groupCode = session.peerUin || session.peerUid
     const name = session.name.trim()
+    const fallbackPrefix = session.kind === 'discussion' ? '讨论组' : '群聊'
     const isFallbackName = !name
       || name === groupCode
-      || name === `群聊 ${groupCode}`
-    return isFallbackName ? `群聊 ${groupCode}` : `${name}（${groupCode}）`
+      || name === `${fallbackPrefix} ${groupCode}`
+    return isFallbackName ? `${fallbackPrefix} ${groupCode}` : `${name}（${groupCode}）`
   }
 
   const qq = session.peerUin || (/^\d+$/.test(session.peerUid) ? session.peerUid : '')
@@ -58,7 +59,9 @@ function sessionDisplayName(session: InactiveSession): string {
 }
 
 function sessionKindLabel(kind: InactiveSession['kind']): string {
-  return kind === 'non_friend' ? '已删除 / 非好友' : '已退出 / 不可用群'
+  if (kind === 'non_friend') return '已删除 / 非好友'
+  if (kind === 'discussion') return '讨论组'
+  return '已退出 / 不可用群'
 }
 
 export function InactiveSessionList({
@@ -134,7 +137,7 @@ export function InactiveSessionList({
         <div className="flex items-start gap-2">
           <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <p>
-            此处比较当前好友、群列表与 QQ 会话索引；导入 nt_msg.db 后还会合并消息表中出现过的全部私聊和群聊。非好友可能包含已删除、已注销或陌生人；不可用群可能包含退群、被移出或群解散。
+            此处比较当前好友、群列表与 QQ 会话索引；导入 nt_msg.db 后还会合并消息表中出现过的全部私聊、群聊和旧版讨论组。非好友可能包含已删除、已注销或陌生人；不可用群可能包含退群、被移出或群解散。
           </p>
         </div>
         {data && data.source !== 'database' && (
@@ -180,6 +183,7 @@ export function InactiveSessionList({
               { value: 'all', label: `全部 (${data?.totalCount ?? 0})` },
               { value: 'non_friend', label: `已删除 / 非好友 (${data?.nonFriendCount ?? 0})` },
               { value: 'unavailable_group', label: `已退出 / 不可用群 (${data?.unavailableGroupCount ?? 0})` },
+              { value: 'discussion', label: `讨论组 (${data?.discussionCount ?? 0})` },
             ]}
           />
           <PillDropdown
@@ -232,7 +236,7 @@ export function InactiveSessionList({
       ) : (
         <div className="flex flex-col">
           {pageItems.map((session) => {
-            const isGroup = session.kind === 'unavailable_group'
+            const isGroup = session.kind !== 'non_friend'
             const displayName = sessionDisplayName(session)
             return (
               <div

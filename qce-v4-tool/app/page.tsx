@@ -753,7 +753,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
 
   const handlePreviewInactiveSession = useCallback((session: InactiveSession) => {
     handlePreviewChat(
-      session.kind === 'unavailable_group' ? 'group' : 'friend',
+      session.kind === 'non_friend' ? 'friend' : 'group',
       session.peerUid,
       session.name,
       {
@@ -768,7 +768,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
     handleOpenTaskWizard({
       chatType: session.chatType,
       peerUid: session.peerUid,
-      peerUin: session.kind === 'unavailable_group'
+      peerUin: session.kind !== 'non_friend'
         ? (session.peerUin || session.peerUid)
         : session.peerUin,
       backupImportId: session.backupImportId,
@@ -2338,13 +2338,30 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
 
                         {/* Running progress inline */}
                         {task.status === "running" && (
-                          <div className="mt-1.5 flex items-center gap-2">
-                            <Progress
-                              value={task.progress}
-                              shimmer={true}
-                              className="h-1.5 rounded-full flex-1 max-w-[240px]"
-                            />
-                            <span className="text-xs font-medium text-muted-foreground/50 tabular-nums">{task.progress}%</span>
+                          <div className="mt-1.5 space-y-1.5">
+                            <div className="flex items-center gap-2">
+                              <Progress
+                                value={task.progress}
+                                shimmer={true}
+                                className="h-1.5 rounded-full flex-1 max-w-[240px]"
+                              />
+                              <span className="text-xs font-medium text-muted-foreground/50 tabular-nums">{task.progress}%</span>
+                            </div>
+                            {task.archiveKind === "account" && task.resourceProgress && task.resourceProgress.total > 0 && (
+                              <div className="flex max-w-[360px] items-center gap-2 text-[11px] text-muted-foreground/55">
+                                <span className="whitespace-nowrap">
+                                  会话 {task.resourceProgress.conversationIndex}/{task.resourceProgress.conversationTotal} · 资源
+                                </span>
+                                <Progress
+                                  value={Math.round(((task.resourceProgress.completed + task.resourceProgress.failed) / task.resourceProgress.total) * 100)}
+                                  className="h-1 flex-1 rounded-full"
+                                />
+                                <span className="tabular-nums">
+                                  {task.resourceProgress.completed + task.resourceProgress.failed}/{task.resourceProgress.total}
+                                  {task.resourceProgress.failed > 0 && `，失败 ${task.resourceProgress.failed}`}
+                                </span>
+                              </div>
+                            )}
                           </div>
                         )}
 
@@ -2365,10 +2382,14 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                             variant="ghost"
                             className="h-8 w-8 rounded-full p-0 text-muted-foreground/60 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/30"
                             onClick={() => {
-                              showDeleteConfirmationToast(`停止任务「${task.sessionName}」？`, "已获取的消息不会保存", async () => {
+                              showDeleteConfirmationToast(
+                                `停止任务「${task.sessionName}」？`,
+                                task.archiveKind === "account" ? "已完成会话会保留断点，下次可继续" : "已获取的消息不会保存",
+                                async () => {
                                 const success = await cancelTask(task.id)
                                 if (!success) throw new Error("停止失败")
-                              })
+                                },
+                              )
                             }}
                             title="停止"
                           >

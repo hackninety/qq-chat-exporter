@@ -453,6 +453,45 @@ test.describe('Inactive sessions', () => {
         await expect(page.getByText('已删除的测试好友（66666）', { exact: true })).toHaveCount(0);
     });
 
+    test('lists imported discussion groups as viewable history sessions', async ({ page }) => {
+        await authenticate(page);
+        await page.route('**/api/inactive-sessions**', async (route) => {
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({
+                    success: true,
+                    data: {
+                        sessions: [{
+                            kind: 'discussion',
+                            chatType: 3,
+                            peerUid: '99887',
+                            peerUin: '99887',
+                            name: '讨论组 99887',
+                            backupImportId: 'backup-discussion',
+                            sourceName: 'nt_msg.db',
+                            messageCount: 83657,
+                        }],
+                        totalCount: 1,
+                        nonFriendCount: 0,
+                        unavailableGroupCount: 0,
+                        discussionCount: 1,
+                        rawCount: 0,
+                        databaseRawCount: 1,
+                        indexSource: 'full',
+                        source: 'database',
+                    },
+                }),
+            });
+        });
+
+        const response = await page.goto(`${FRONTEND_BASE}/qce/inactive/`).catch(() => null);
+        test.skip(!response || response.status() >= 500, `frontend not reachable at ${FRONTEND_BASE}`);
+        await expect(page.getByRole('button', { name: '预览 讨论组 99887 聊天记录' })).toBeVisible();
+        await page.getByRole('button', { name: '全部 (1)' }).click();
+        await expect(page.getByRole('menuitem', { name: '讨论组 (1)' })).toBeVisible();
+    });
+
     test('uploads a backup, previews its history and exports with the import id', async ({ page }) => {
         await authenticate(page);
         let imported = false;
@@ -705,7 +744,7 @@ test.describe('Account archive exports', () => {
             messageCount: 12345,
         };
         let previewBody: { backupImportId?: string } | undefined;
-        let createBody: { backupImportId?: string; debugExport?: boolean } | undefined;
+        let createBody: { backupImportId?: string; debugExport?: boolean; resume?: boolean } | undefined;
         await page.route('**/api/chat-backups', async (route, request) => {
             if (request.method() !== 'GET') {
                 await route.continue();
@@ -734,6 +773,8 @@ test.describe('Account archive exports', () => {
                         localSessionCount: 80,
                         warningCount: 0,
                         warnings: [],
+                        resumeAvailable: true,
+                        completedCheckpointCount: 37,
                         fixedIncludes: ['messages.sqlite（规范化消息与 FTS5 索引）', 'source/nt_msg.sqlite（已解密源库副本）'],
                         notice: '所选已解密备份将关联到当前登录账号。',
                     },
@@ -761,10 +802,12 @@ test.describe('Account archive exports', () => {
         await expect.poll(() => previewBody).toEqual({ backupImportId: backup.id });
         await expect(page.getByText('已删除/非好友', { exact: true })).toBeVisible();
         await expect(page.getByText('已退出/不可用群', { exact: true })).toBeVisible();
-        await expect(dialog.getByRole('checkbox')).toBeChecked();
+        await expect(dialog.getByRole('checkbox', { name: /继续上次未完成的导出/ })).toBeChecked();
+        await expect(dialog.getByText(/已保存 37 个会话断点/)).toBeVisible();
+        await expect(dialog.getByRole('checkbox', { name: /同时生成 \.debug/ })).toBeChecked();
 
         await dialog.getByRole('button', { name: '创建导出任务', exact: true }).click();
-        await expect.poll(() => createBody).toEqual({ backupImportId: backup.id, debugExport: true });
+        await expect.poll(() => createBody).toEqual({ backupImportId: backup.id, debugExport: true, resume: true });
     });
 });
 

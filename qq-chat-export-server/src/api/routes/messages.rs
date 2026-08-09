@@ -1463,6 +1463,31 @@ pub(crate) fn to_exporter_resource_map(
         .collect()
 }
 
+/// 消费资源映射并转成导出器结构，供超大全账号归档避免再复制路径和文件名字符串。
+pub(crate) fn into_exporter_resource_map(
+    resource_map: HashMap<String, Vec<ResourceInfo>>,
+) -> HashMap<String, Vec<MessageResource>> {
+    resource_map
+        .into_iter()
+        .map(|(msg_id, resources)| {
+            let converted = resources
+                .into_iter()
+                .map(|resource| MessageResource {
+                    resource_type: resource.resource_type,
+                    filename: resource.file_name,
+                    size: resource.file_size.and_then(|size| u64::try_from(size).ok()),
+                    url: (!resource.original_url.is_empty()).then_some(resource.original_url),
+                    local_path: resource.local_path,
+                    width: None,
+                    height: None,
+                    duration: None,
+                })
+                .collect();
+            (msg_id, converted)
+        })
+        .collect()
+}
+
 /// 把资源映射序列化成 `update_single_message_resource_paths` 需要的 Value 列表。
 fn to_value_resource_map(
     resource_map: &HashMap<String, Vec<ResourceInfo>>,

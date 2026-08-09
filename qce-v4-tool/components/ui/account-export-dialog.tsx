@@ -37,6 +37,7 @@ export function AccountExportDialog({
 }: AccountExportDialogProps) {
   const [backupImportId, setBackupImportId] = useState("")
   const [debugExport, setDebugExport] = useState(true)
+  const [resume, setResume] = useState(true)
   const [preview, setPreview] = useState<AccountExportPreview | null>(null)
   const [previewLoading, setPreviewLoading] = useState(false)
   const [creating, setCreating] = useState(false)
@@ -70,6 +71,7 @@ export function AccountExportDialog({
           throw new Error(result.error?.message || "全账号归档预检失败")
         }
         setPreview(result.data)
+        setResume(result.data.resumeAvailable !== false)
       })
       .catch((previewError) => {
         if (previewError instanceof DOMException && previewError.name === "AbortError") return
@@ -93,7 +95,7 @@ export function AccountExportDialog({
       const response = await fetch("/api/account-exports", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ backupImportId, debugExport }),
+        body: JSON.stringify({ backupImportId, debugExport, resume }),
       })
       const result = await response.json() as APIResponse<{ taskId: string }>
       if (!response.ok || !result.success || !result.data?.taskId) {
@@ -180,6 +182,22 @@ export function AccountExportDialog({
                 {preview.notice} 全量资源可能占用较多磁盘并持续较长时间；单项失败会记录警告，不会中止整个归档。
               </p>
             </div>
+          )}
+
+          {preview?.resumeAvailable && (
+            <label className="flex items-start gap-3 rounded-xl border border-blue-200 bg-blue-50/60 p-4 dark:border-blue-900 dark:bg-blue-950/20">
+              <Checkbox
+                checked={resume}
+                onCheckedChange={(checked) => setResume(checked === true)}
+                disabled={creating}
+              />
+              <span className="space-y-1">
+                <span className="block text-sm font-medium">继续上次未完成的导出</span>
+                <span className="block text-xs leading-relaxed text-muted-foreground">
+                  已保存 {preview.completedCheckpointCount?.toLocaleString() ?? 0} 个会话断点；继续后会跳过这些会话的读取、解析与媒体下载。
+                </span>
+              </span>
+            </label>
           )}
 
           <label className="flex items-start gap-3 rounded-xl border p-4">

@@ -26,6 +26,11 @@ fn normalize_task_for_frontend(task: &Value) -> Value {
         if let Some(tid) = obj.get("taskId").cloned() {
             obj.insert("id".to_string(), tid);
         }
+        if !obj.contains_key("progressMessage") {
+            if let Some(message) = obj.get("message").cloned() {
+                obj.insert("progressMessage".to_string(), message);
+            }
+        }
         // flatten filter.startTime / filter.endTime
         if let Some(filter) = obj.get("filter").cloned() {
             if !obj.contains_key("startTime") {

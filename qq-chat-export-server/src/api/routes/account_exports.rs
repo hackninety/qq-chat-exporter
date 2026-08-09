@@ -1,19 +1,22 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::future::Future;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::extract::{Extension, Json, State};
 use axum::response::Response;
 use chrono::Local;
+use md5::{Digest, Md5};
 use qce_exporter::account_archive_exporter::{
     AccountArchiveAccount, AccountArchiveBuilder, AccountArchiveConversation,
     AccountArchiveExtraResource, AccountArchiveOptions, AccountArchiveOutcome,
     AccountArchiveWarning, AccountConversationCategory, AccountRelationshipStatus,
 };
-use qce_exporter::types::{CancellationToken, ChatInfo, CleanMessage};
-use serde::Deserialize;
+use qce_exporter::types::{CancellationToken, ChatInfo, CleanMessage, MessageResource};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::api::helpers::backfill_self_sender_names;
@@ -22,9 +25,9 @@ use crate::api::response::{self, ApiError, ErrorType, RequestId};
 use crate::api::routes::albums::{fetch_album_list, fetch_album_media};
 use crate::api::routes::files::{download_file_to, fetch_all_files_recursive};
 use crate::api::routes::messages::{
-    broadcast_progress, fill_group_member_names, generate_download_url, generate_task_id, now_iso,
-    prepare_output_directory, register_task, release_export_path, reserve_export_file_name,
-    to_exporter_resource_map, update_task,
+    broadcast_progress, fill_group_member_names, generate_download_url, generate_task_id,
+    into_exporter_resource_map, now_iso, prepare_output_directory, register_task,
+    release_export_path, reserve_export_file_name, update_task,
 };
 use crate::api::routes::stickers::get_sticker_packs;
 use crate::api::state::SharedState;
@@ -32,6 +35,10 @@ use crate::backup_import::ImportedSession;
 use crate::export_debug::ExportDebugSession;
 use crate::fetcher::{BatchFetchConfig, BatchMessageFetcher, MessageFilter, Peer};
 use crate::parser::{ForwardFetcher, SimpleMessageParser, SimpleParserOptions};
+use crate::resource::{ResourceProgress, ResourceProgressCallback};
+
+const LIVE_HISTORY_OVERLAP_MS: i64 = 24 * 60 * 60 * 1000;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +48,12 @@ pub struct AccountExportRequest {
     debug_export: bool,
     #[serde(default)]
     output_dir: String,
+    #[serde(default = "default_resume_export")]
+    resume: bool,
+}
+
+const fn default_resume_export() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +69,16 @@ struct AccountSession {
     source: String,
     aliases: Vec<(String, String)>,
     backup_peers: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversationCheckpoint {
+    schema_version: u32,
+    conversation_id: String,
+    messages: Vec<CleanMessage>,
+    resource_map: HashMap<String, Vec<MessageResource>>,
+    warnings: Vec<AccountArchiveWarning>,
 }
 
 impl AccountSession {
@@ -123,6 +146,8 @@ pub async fn preview_account_export(
                 "localSessionCount": prepared.inventory.local_session_count,
                 "warningCount": prepared.inventory.warnings.len(),
                 "warnings": prepared.inventory.warnings,
+                "resumeAvailable": prepared.completed_checkpoint_count > 0,
+                "completedCheckpointCount": prepared.completed_checkpoint_count,
                 "fixedIncludes": [
                     "messages.sqlite（规范化消息与 FTS5 索引）",
                     "source/nt_msg.sqlite（已解密源库副本）",
@@ -181,8 +206,10 @@ pub async fn create_account_export(
         "conversationCount": prepared.inventory.sessions.len(),
         "resourceCount": 0,
         "missingResourceCount": 0,
+        "resumeAvailable": prepared.completed_checkpoint_count > 0,
+        "resumedConversationCount": 0,
         "createdAt": now_iso(),
-        "options": { "debugExport": request.debug_export, "outputDir": request.output_dir },
+        "options": { "debugExport": request.debug_export, "outputDir": request.output_dir, "resume": request.resume },
     });
     if !register_task(&state, &task).await {
         release_export_path(&output_path);
@@ -226,6 +253,8 @@ struct PreparedAccountExport {
     inventory: AccountInventory,
     output_dir: PathBuf,
     custom_output_dir: String,
+    checkpoint_dir: PathBuf,
+    completed_checkpoint_count: usize,
 }
 
 async fn prepare_account_export(
@@ -274,6 +303,17 @@ async fn prepare_account_export(
             )
         })?;
     let inventory = build_inventory(state, imported).await?;
+    let checkpoint_dir = account_checkpoint_dir(
+        &state.path_manager.account_export_checkpoints_dir(),
+        &request.backup_import_id,
+        inventory
+            .account
+            .uin
+            .as_deref()
+            .or(inventory.account.uid.as_deref())
+            .unwrap_or("unknown"),
+    );
+    let completed_checkpoint_count = count_conversation_checkpoints(&checkpoint_dir).await;
 
     let custom_output_dir = crate::paths::PathManager::sanitize_path(&request.output_dir);
     let requested_output_dir = if custom_output_dir.trim().is_empty() {
@@ -299,6 +339,8 @@ async fn prepare_account_export(
         inventory,
         output_dir,
         custom_output_dir,
+        checkpoint_dir,
+        completed_checkpoint_count,
     })
 }
 
@@ -738,14 +780,14 @@ async fn run_account_export(
             update_task(
                 &state,
                 &task_id,
-                json!({"status":"cancelled","message":"任务已停止","completedAt":now_iso()}),
+                json!({"status":"cancelled","message":"任务已停止；已完成会话的断点已保留，可重新创建任务继续","resumeAvailable":true,"completedAt":now_iso()}),
             )
             .await;
         } else {
             update_task(
                 &state,
                 &task_id,
-                json!({"status":"failed","error":error,"completedAt":now_iso()}),
+                json!({"status":"failed","error":error,"resumeAvailable":true,"completedAt":now_iso()}),
             )
             .await;
             state.broadcast_ws(&json!({
@@ -810,6 +852,14 @@ async fn process_account_export(
     let total_sessions = prepared.inventory.sessions.len().max(1);
     let mut total_messages = 0usize;
     let mut participant_uins = HashSet::new();
+    let checkpoint_dir = prepared.checkpoint_dir.clone();
+    if !request.resume {
+        let _ = tokio::fs::remove_dir_all(&checkpoint_dir).await;
+    }
+    tokio::fs::create_dir_all(checkpoint_dir.join("conversations"))
+        .await
+        .map_err(|error| format!("创建归档断点目录失败: {error}"))?;
+    let mut resumed_conversations = 0usize;
 
     for (index, session) in prepared.inventory.sessions.iter().enumerate() {
         ensure_not_cancelled(&cancel_flag, &cancellation)?;
@@ -827,6 +877,46 @@ async fn process_account_export(
         )
         .await;
         broadcast_progress(state, task_id, progress, &message, total_messages);
+
+        if request.resume {
+            if let Some(checkpoint) =
+                load_conversation_checkpoint(&checkpoint_dir, &session.conversation_id).await?
+            {
+                collect_participant_uins(&checkpoint.messages, &mut participant_uins);
+                total_messages += checkpoint.messages.len();
+                warnings.extend(checkpoint.warnings);
+                let conversation = account_conversation(
+                    session,
+                    &prepared.inventory.account,
+                    checkpoint.messages,
+                    checkpoint.resource_map,
+                );
+                builder = builder_add_conversation(builder, conversation).await?;
+                resumed_conversations += 1;
+                update_task(
+                    state,
+                    task_id,
+                    json!({
+                        "resumedConversationCount": resumed_conversations,
+                        "resumeAvailable": true,
+                        "messageCount": total_messages,
+                    }),
+                )
+                .await;
+                if let Some(debug) = &debug {
+                    debug
+                        .trace()
+                        .record(json!({
+                            "type": "conversation_resumed_from_checkpoint",
+                            "conversationId": session.conversation_id,
+                            "conversationIndex": index + 1,
+                        }))
+                        .await;
+                }
+                continue;
+            }
+        }
+        let warning_start = warnings.len();
 
         let mut raw_messages = Vec::new();
         for backup_peer in &session.backup_peers {
@@ -851,15 +941,22 @@ async fn process_account_export(
                 )),
             }
         }
-        match fetch_live_messages(state, session, &cancel_flag).await {
-            Ok(live) => raw_messages = merge_raw_messages(raw_messages, live),
-            Err(error) => warnings.push(warning(
-                "conversation",
-                "LIVE_MESSAGES_FAILED",
-                format!("在线补齐 {} 失败，已保留备份消息: {error}", session.name),
-                Some(&session.conversation_id),
-                None,
-            )),
+        let live_start_time = raw_messages
+            .iter()
+            .map(raw_message_time_ms)
+            .max()
+            .map(|time| time.saturating_sub(LIVE_HISTORY_OVERLAP_MS));
+        if session.chat_type != 3 {
+            match fetch_live_messages(state, session, &cancel_flag, live_start_time).await {
+                Ok(live) => raw_messages = merge_raw_messages(raw_messages, live),
+                Err(error) => warnings.push(warning(
+                    "conversation",
+                    "LIVE_MESSAGES_FAILED",
+                    format!("在线补齐 {} 失败，已保留备份消息: {error}", session.name),
+                    Some(&session.conversation_id),
+                    None,
+                )),
+            }
         }
         raw_messages.sort_by_key(raw_message_time_ms);
         if session.chat_type == 2 && !raw_messages.is_empty() {
@@ -892,29 +989,30 @@ async fn process_account_export(
         let self_uin = prepared.inventory.account.uin.as_deref();
         let self_name = Some(prepared.inventory.account.name.as_str());
         backfill_self_sender_names(&mut clean_messages, self_uid, self_uin, self_name);
-        for message in &clean_messages {
-            if let Some(uin) = message
-                .sender
-                .uin
-                .as_deref()
-                .filter(|value| !value.is_empty())
-            {
-                participant_uins.insert(uin.to_owned());
-            }
-        }
+        collect_participant_uins(&clean_messages, &mut participant_uins);
 
-        let mut resource_messages = raw_messages.clone();
-        resource_messages.extend(parser.take_forward_raw_messages());
+        let forward_messages = parser.take_forward_raw_messages();
+        let resource_progress = account_resource_progress_callback(
+            state,
+            task_id,
+            index,
+            prepared.inventory.sessions.len(),
+            progress,
+            session.name.clone(),
+            total_messages,
+        );
         let (resource_map, summary) = state
             .resource_handler
-            .process_message_resources_with_batch_config(
-                &resource_messages,
+            .process_message_resource_batches_with_batch_config(
+                &[raw_messages.as_slice(), forward_messages.as_slice()],
                 Arc::clone(&cancel_flag),
                 debug.as_ref().map(ExportDebugSession::trace),
-                None,
+                Some(resource_progress),
                 Vec::new(),
             )
             .await;
+        drop(forward_messages);
+        drop(raw_messages);
         if summary.failed > 0 {
             warnings.push(warning(
                 "conversation",
@@ -943,6 +1041,7 @@ async fn process_account_export(
             );
         }
         SimpleMessageParser::backfill_reply_preview_local_paths(&mut clean_messages);
+        drop(value_resource_map);
         if let Some(debug) = &debug {
             debug
                 .write_jsonl(
@@ -951,12 +1050,20 @@ async fn process_account_export(
                 )
                 .await?;
         }
-        total_messages += clean_messages.len();
+        let checkpoint = ConversationCheckpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            conversation_id: session.conversation_id.clone(),
+            messages: clean_messages,
+            resource_map: into_exporter_resource_map(resource_map),
+            warnings: warnings[warning_start..].to_vec(),
+        };
+        let checkpoint = write_conversation_checkpoint(&checkpoint_dir, checkpoint).await?;
+        total_messages += checkpoint.messages.len();
         let conversation = account_conversation(
             session,
             &prepared.inventory.account,
-            clean_messages,
-            to_exporter_resource_map(&resource_map),
+            checkpoint.messages,
+            checkpoint.resource_map,
         );
         builder = builder_add_conversation(builder, conversation).await?;
     }
@@ -1009,6 +1116,7 @@ async fn process_account_export(
             .await?;
         let _ = debug.finish().await?;
     }
+    let _ = tokio::fs::remove_dir_all(&checkpoint_dir).await;
     finish_task_success(state, task_id, &outcome, file_name, download_url).await;
     Ok(())
 }
@@ -1047,10 +1155,174 @@ fn account_conversation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn account_resource_progress_callback(
+    state: &SharedState,
+    task_id: &str,
+    conversation_index: usize,
+    conversation_total: usize,
+    overall_progress: i64,
+    conversation_name: String,
+    message_count: usize,
+) -> ResourceProgressCallback {
+    let state = Arc::clone(state);
+    let task_id = task_id.to_owned();
+    let last_emit_ms = Arc::new(AtomicU64::new(0));
+    Arc::new(move |resource: ResourceProgress| {
+        let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+        let finished = resource.completed.saturating_add(resource.failed) >= resource.total;
+        let previous = last_emit_ms.load(Ordering::Relaxed);
+        if !finished && now_ms.saturating_sub(previous) < 500 {
+            return;
+        }
+        if last_emit_ms
+            .compare_exchange(previous, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let state = Arc::clone(&state);
+        let task_id = task_id.clone();
+        let conversation_name = conversation_name.clone();
+        tokio::spawn(async move {
+            let progress_message = format!(
+                "正在处理 {conversation_name} 的资源 {}/{}",
+                resource.completed.saturating_add(resource.failed),
+                resource.total
+            );
+            update_task(
+                &state,
+                &task_id,
+                json!({
+                    "message": progress_message,
+                    "resourceProgress": {
+                        "total": resource.total,
+                        "completed": resource.completed,
+                        "failed": resource.failed,
+                        "current": resource.current,
+                        "conversationIndex": conversation_index + 1,
+                        "conversationTotal": conversation_total,
+                    }
+                }),
+            )
+            .await;
+            broadcast_progress(
+                &state,
+                &task_id,
+                overall_progress,
+                &progress_message,
+                message_count,
+            );
+        });
+    })
+}
+
+fn collect_participant_uins(messages: &[CleanMessage], participant_uins: &mut HashSet<String>) {
+    for message in messages {
+        if let Some(uin) = message
+            .sender
+            .uin
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            participant_uins.insert(uin.to_owned());
+        }
+    }
+}
+
+fn md5_hex(value: &str) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn account_checkpoint_dir(root: &Path, backup_import_id: &str, account_id: &str) -> PathBuf {
+    root.join(md5_hex(&format!("{backup_import_id}|{account_id}")))
+}
+
+fn conversation_checkpoint_path(root: &Path, conversation_id: &str) -> PathBuf {
+    root.join("conversations")
+        .join(format!("{}.json", md5_hex(conversation_id)))
+}
+
+async fn count_conversation_checkpoints(root: &Path) -> usize {
+    let directory = root.join("conversations");
+    let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
+        return 0;
+    };
+    let mut count = 0;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
+            count += 1;
+        }
+    }
+    count
+}
+
+async fn load_conversation_checkpoint(
+    root: &Path,
+    conversation_id: &str,
+) -> Result<Option<ConversationCheckpoint>, String> {
+    let path = conversation_checkpoint_path(root, conversation_id);
+    if !tokio::fs::try_exists(&path)
+        .await
+        .map_err(|error| format!("检查归档断点失败: {error}"))?
+    {
+        return Ok(None);
+    }
+    let expected_id = conversation_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let checkpoint: ConversationCheckpoint = serde_json::from_reader(BufReader::new(
+            File::open(&path).map_err(|error| format!("打开归档断点失败: {error}"))?,
+        ))
+        .map_err(|error| format!("读取归档断点失败: {error}"))?;
+        if checkpoint.schema_version != CHECKPOINT_SCHEMA_VERSION
+            || checkpoint.conversation_id != expected_id
+        {
+            return Err("归档断点版本或会话标识不匹配".to_owned());
+        }
+        Ok(Some(checkpoint))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+async fn write_conversation_checkpoint(
+    root: &Path,
+    checkpoint: ConversationCheckpoint,
+) -> Result<ConversationCheckpoint, String> {
+    let destination = conversation_checkpoint_path(root, &checkpoint.conversation_id);
+    let temporary = destination.with_extension("json.part");
+    tokio::task::spawn_blocking(move || {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("创建归档断点目录失败: {error}"))?;
+        }
+        let file =
+            File::create(&temporary).map_err(|error| format!("创建归档断点失败: {error}"))?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &checkpoint)
+            .map_err(|error| format!("写入归档断点失败: {error}"))?;
+        writer
+            .flush()
+            .map_err(|error| format!("刷新归档断点失败: {error}"))?;
+        if destination.exists() {
+            std::fs::remove_file(&destination)
+                .map_err(|error| format!("替换归档断点失败: {error}"))?;
+        }
+        std::fs::rename(&temporary, &destination)
+            .map_err(|error| format!("提交归档断点失败: {error}"))?;
+        Ok(checkpoint)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 async fn fetch_live_messages(
     state: &SharedState,
     session: &AccountSession,
     cancel_flag: &Arc<AtomicBool>,
+    start_time: Option<i64>,
 ) -> Result<Vec<Value>, String> {
     let fetcher = BatchMessageFetcher::new(
         Arc::new(state.napcat.clone()),
@@ -1066,7 +1338,10 @@ async fn fetch_live_messages(
         peer_uid: session.peer_uid.clone(),
         guild_id: None,
     };
-    let filter = MessageFilter::default();
+    let filter = MessageFilter {
+        start_time,
+        ..MessageFilter::default()
+    };
     let mut previous = None;
     let mut messages = Vec::new();
     loop {
@@ -1632,7 +1907,11 @@ fn list_payload(value: &Value, wrappers: &[&str]) -> Option<Vec<Value>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_raw_messages, merge_session, AccountSession};
+    use super::{
+        load_conversation_checkpoint, merge_raw_messages, merge_session,
+        write_conversation_checkpoint, AccountSession, ConversationCheckpoint,
+        CHECKPOINT_SCHEMA_VERSION,
+    };
     use qce_exporter::account_archive_exporter::{
         AccountConversationCategory, AccountRelationshipStatus,
     };
@@ -1677,5 +1956,33 @@ mod tests {
         let merged = merge_raw_messages(backup, live);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0]["elements"][0], "new");
+    }
+
+    #[tokio::test]
+    async fn conversation_checkpoint_roundtrips_and_validates_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "qce-account-checkpoint-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let checkpoint = ConversationCheckpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            conversation_id: "3:99887".to_owned(),
+            messages: Vec::new(),
+            resource_map: std::collections::HashMap::new(),
+            warnings: Vec::new(),
+        };
+        write_conversation_checkpoint(&root, checkpoint)
+            .await
+            .unwrap();
+        let loaded = load_conversation_checkpoint(&root, "3:99887")
+            .await
+            .unwrap()
+            .expect("checkpoint");
+        assert_eq!(loaded.conversation_id, "3:99887");
+        assert!(load_conversation_checkpoint(&root, "3:other")
+            .await
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

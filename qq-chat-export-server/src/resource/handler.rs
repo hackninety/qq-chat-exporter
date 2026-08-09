@@ -154,7 +154,7 @@ struct DownloadTask {
     chat_type: i64,
     peer_uid: String,
     element_id: String,
-    element: Value,
+    source_path: Option<String>,
     priority: i64,
 }
 
@@ -313,6 +313,25 @@ impl ResourceHandler {
         progress_callback: Option<ResourceProgressCallback>,
         skip_download_types: Vec<String>,
     ) -> (HashMap<String, Vec<ResourceInfo>>, ResourceBatchSummary) {
+        self.process_message_resource_batches_with_batch_config(
+            &[messages],
+            cancel_flag,
+            debug_trace,
+            progress_callback,
+            skip_download_types,
+        )
+        .await
+    }
+
+    /// 处理多段消息切片，避免账户归档为了附加合并转发消息而复制整段原始消息。
+    pub async fn process_message_resource_batches_with_batch_config(
+        self: &Arc<Self>,
+        message_batches: &[&[Value]],
+        cancel_flag: Arc<AtomicBool>,
+        debug_trace: Option<ExportDebugTrace>,
+        progress_callback: Option<ResourceProgressCallback>,
+        skip_download_types: Vec<String>,
+    ) -> (HashMap<String, Vec<ResourceInfo>>, ResourceBatchSummary) {
         let _batch_permit = self
             .batch_gate
             .acquire()
@@ -336,57 +355,77 @@ impl ResourceHandler {
         let mut resource_refs: HashMap<String, Vec<Arc<Mutex<ResourceInfo>>>> = HashMap::new();
         let mut all_resources: Vec<(Arc<Mutex<ResourceInfo>>, InitialState)> = Vec::new();
         let mut tasks: Vec<DownloadTask> = Vec::new();
+        let mut resources_by_key: HashMap<String, Arc<Mutex<ResourceInfo>>> = HashMap::new();
 
-        for message in messages {
-            if cancel_flag.load(Ordering::SeqCst) {
-                break;
-            }
-            let msg_id = str_field(message, "msgId").unwrap_or_default().to_string();
-            let chat_type = message.get("chatType").and_then(Value::as_i64).unwrap_or(0);
-            let peer_uid = str_field(message, "peerUid")
-                .unwrap_or_default()
-                .to_string();
-            let Some(elements) = message.get("elements").and_then(Value::as_array) else {
-                continue;
-            };
-            let mut resources_for_message: Vec<Arc<Mutex<ResourceInfo>>> = Vec::new();
-
-            for element in elements {
+        for messages in message_batches {
+            for message in *messages {
                 if cancel_flag.load(Ordering::SeqCst) {
                     break;
                 }
-                if !is_media_element(element) {
-                    continue;
-                }
-                let Some((mut resource, initial)) = self.process_element(element).await else {
+                let msg_id = str_field(message, "msgId").unwrap_or_default().to_string();
+                let chat_type = message.get("chatType").and_then(Value::as_i64).unwrap_or(0);
+                let peer_uid = str_field(message, "peerUid")
+                    .unwrap_or_default()
+                    .to_string();
+                let Some(elements) = message.get("elements").and_then(Value::as_array) else {
                     continue;
                 };
-                if initial == InitialState::Pending {
-                    let element_id = str_field(element, "elementId")
-                        .unwrap_or_default()
-                        .to_string();
-                    resource.status = "pending".to_string();
-                    let shared = Arc::new(Mutex::new(resource));
-                    tasks.push(DownloadTask {
-                        resource: Arc::clone(&shared),
-                        msg_id: msg_id.clone(),
-                        chat_type,
-                        peer_uid: peer_uid.clone(),
-                        element_id,
-                        element: element.clone(),
-                        priority: calculate_priority(&*shared.lock().await),
-                    });
-                    resources_for_message.push(Arc::clone(&shared));
-                    all_resources.push((shared, initial));
-                } else {
-                    let shared = Arc::new(Mutex::new(resource));
-                    resources_for_message.push(Arc::clone(&shared));
-                    all_resources.push((shared, initial));
-                }
-            }
+                let mut resources_for_message: Vec<Arc<Mutex<ResourceInfo>>> = Vec::new();
 
-            if !resources_for_message.is_empty() && !msg_id.is_empty() {
-                resource_refs.insert(msg_id, resources_for_message);
+                for element in elements {
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if !is_media_element(element) {
+                        continue;
+                    }
+                    let Some(base) = extract_resource_info(element) else {
+                        continue;
+                    };
+                    let dedup_key = resource_dedup_key(&base);
+                    if let Some(shared) =
+                        dedup_key.as_ref().and_then(|key| resources_by_key.get(key))
+                    {
+                        resources_for_message.push(Arc::clone(shared));
+                        continue;
+                    }
+                    let (mut resource, initial) = self.prepare_resource(base).await;
+                    if initial == InitialState::Pending {
+                        let element_id = str_field(element, "elementId")
+                            .unwrap_or_default()
+                            .to_string();
+                        resource.status = "pending".to_string();
+                        let shared = Arc::new(Mutex::new(resource));
+                        tasks.push(DownloadTask {
+                            resource: Arc::clone(&shared),
+                            msg_id: msg_id.clone(),
+                            chat_type,
+                            peer_uid: peer_uid.clone(),
+                            element_id,
+                            source_path: element_source_path(element),
+                            priority: calculate_priority(&*shared.lock().await),
+                        });
+                        if let Some(key) = dedup_key {
+                            resources_by_key.insert(key, Arc::clone(&shared));
+                        }
+                        resources_for_message.push(Arc::clone(&shared));
+                        all_resources.push((shared, initial));
+                    } else {
+                        let shared = Arc::new(Mutex::new(resource));
+                        if let Some(key) = dedup_key {
+                            resources_by_key.insert(key, Arc::clone(&shared));
+                        }
+                        resources_for_message.push(Arc::clone(&shared));
+                        all_resources.push((shared, initial));
+                    }
+                }
+
+                if !resources_for_message.is_empty() && !msg_id.is_empty() {
+                    resource_refs
+                        .entry(msg_id)
+                        .or_default()
+                        .extend(resources_for_message);
+                }
             }
         }
 
@@ -454,8 +493,7 @@ impl ResourceHandler {
     }
 
     /// 处理单个媒体元素：提取信息、合并缓存、健康检查、判定初始状态并写库。
-    async fn process_element(&self, element: &Value) -> Option<(ResourceInfo, InitialState)> {
-        let base = extract_resource_info(element)?;
+    async fn prepare_resource(&self, base: ResourceInfo) -> (ResourceInfo, InitialState) {
         let mut resource = self.merge_with_cached_resource(base).await;
 
         let local_path = resource
@@ -494,7 +532,7 @@ impl ResourceHandler {
         if let Err(error) = self.db.save_resource_info(&resource).await {
             tracing::warn!("保存资源信息失败: {error}");
         }
-        Some((resource, initial))
+        (resource, initial)
     }
 
     /// 与数据库缓存记录合并。
@@ -562,8 +600,10 @@ impl ResourceHandler {
         self.pending_downloads
             .store(tasks.len(), std::sync::atomic::Ordering::SeqCst);
 
+        let max_in_flight = self.config.max_concurrent_downloads.max(1);
+        let mut tasks = tasks.into_iter();
         let mut join_set: JoinSet<()> = JoinSet::new();
-        for task in tasks {
+        let spawn_task = |join_set: &mut JoinSet<()>, task: DownloadTask| {
             let handler = Arc::clone(self);
             let task_cancel_flag = Arc::clone(&cancel_flag);
             let task_debug_trace = debug_trace.clone();
@@ -577,12 +617,18 @@ impl ResourceHandler {
                     .await;
                 handler.pending_downloads.fetch_sub(1, Ordering::SeqCst);
             });
+        };
+        for task in tasks.by_ref().take(max_in_flight) {
+            spawn_task(&mut join_set, task);
         }
         loop {
             tokio::select! {
                 result = join_set.join_next() => {
                     if result.is_none() {
                         break;
+                    }
+                    if let Some(task) = tasks.next() {
+                        spawn_task(&mut join_set, task);
                     }
                 }
                 () = wait_for_cancellation(cancel_flag.as_ref()) => {
@@ -808,17 +854,17 @@ impl ResourceHandler {
         if file_matches_expected_size(&local_path, expected_size).await {
             return Ok(local_path);
         }
-        if let Some(source_path) = element_source_path(&task.element) {
-            if file_matches_expected_size(&source_path, expected_size).await {
+        if let Some(source_path) = task.source_path.as_deref() {
+            if file_matches_expected_size(source_path, expected_size).await {
                 if source_path == local_path {
                     return Ok(local_path);
                 }
-                if tokio::fs::copy(&source_path, &local_path).await.is_ok()
+                if tokio::fs::copy(source_path, &local_path).await.is_ok()
                     && file_matches_expected_size(&local_path, expected_size).await
                 {
                     return Ok(local_path);
                 }
-                return Ok(source_path);
+                return Ok(source_path.to_owned());
             }
         }
 
@@ -845,8 +891,7 @@ impl ResourceHandler {
                 return Ok(local_path);
             }
             // 回退到元素自带的源路径
-            let source_path = element_source_path(&task.element);
-            if let Some(source_path) = source_path {
+            if let Some(source_path) = task.source_path.clone() {
                 if tokio::fs::metadata(&source_path).await.is_ok() {
                     if source_path != local_path
                         && tokio::fs::copy(&source_path, &local_path).await.is_ok()
@@ -1063,6 +1108,18 @@ fn extract_resource_info(element: &Value) -> Option<ResourceInfo> {
         ));
     }
     None
+}
+
+/// 同一批次内按资源类型和 MD5（或 NTQQ 提供的等价稳定键）合并下载任务。
+fn resource_dedup_key(resource: &ResourceInfo) -> Option<String> {
+    let md5 = resource.md5.trim();
+    (!md5.is_empty()).then(|| {
+        format!(
+            "{}:{}",
+            resource.resource_type.to_ascii_lowercase(),
+            md5.to_ascii_lowercase()
+        )
+    })
 }
 
 /// 构造基础资源信息。
@@ -1462,6 +1519,10 @@ mod tests {
         attempts: AtomicUsize,
     }
 
+    struct CountingDownloader {
+        attempts: AtomicUsize,
+    }
+
     #[async_trait]
     impl MediaDownloader for AlwaysTimeoutDownloader {
         async fn download_media(
@@ -1475,6 +1536,22 @@ mod tests {
         ) -> Result<String, String> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             Err(format!("timeout after {timeout_ms}ms"))
+        }
+    }
+
+    #[async_trait]
+    impl MediaDownloader for CountingDownloader {
+        async fn download_media(
+            &self,
+            _msg_id: &str,
+            _chat_type: i64,
+            _peer_uid: &str,
+            _element_id: &str,
+            _dest_path: &str,
+            _timeout_ms: u64,
+        ) -> Result<String, String> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err("404".to_string())
         }
     }
 
@@ -1492,7 +1569,7 @@ mod tests {
             chat_type: 2,
             peer_uid: "peer".to_string(),
             element_id: element_id.to_string(),
-            element: json!({ "picElement": { "fileName": file_name } }),
+            source_path: None,
             priority: 100,
         }
     }
@@ -1599,6 +1676,54 @@ mod tests {
             downloader.attempts.load(Ordering::SeqCst),
             MAX_TIMEOUT_ATTEMPTS as usize
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_md5_is_downloaded_once_and_mapped_to_every_message() {
+        let root = std::env::temp_dir().join(format!("qce-dedup-{}", uuid::Uuid::new_v4()));
+        let downloader = Arc::new(CountingDownloader {
+            attempts: AtomicUsize::new(0),
+        });
+        let db = Arc::new(DatabaseManager::new(&root.join("qce.db")));
+        let handler = Arc::new(
+            ResourceHandler::new(
+                downloader.clone(),
+                None,
+                db,
+                ResourceHandlerConfig {
+                    storage_root: root.clone(),
+                    ..ResourceHandlerConfig::default()
+                },
+            )
+            .await,
+        );
+        let messages = [
+            json!({
+                "msgId": "1", "chatType": 2, "peerUid": "group",
+                "elements": [{"elementId":"11","picElement":{"fileName":"a.jpg","md5HexStr":"ABCDEF"}}]
+            }),
+            json!({
+                "msgId": "2", "chatType": 2, "peerUid": "group",
+                "elements": [{"elementId":"22","picElement":{"fileName":"copy.jpg","md5HexStr":"abcdef"}}]
+            }),
+        ];
+
+        let (resources, summary) = handler
+            .process_message_resource_batches_with_batch_config(
+                &[&messages[..1], &messages[1..]],
+                Arc::new(AtomicBool::new(false)),
+                None,
+                None,
+                Vec::new(),
+            )
+            .await;
+
+        assert_eq!(downloader.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(resources.get("1").map(Vec::len), Some(1));
+        assert_eq!(resources.get("2").map(Vec::len), Some(1));
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[test]

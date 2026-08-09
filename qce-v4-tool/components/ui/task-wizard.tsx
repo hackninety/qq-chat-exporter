@@ -291,9 +291,10 @@ export function TaskWizard({
     if (!isOpen || didInitTargetRef.current) return
     if (prefilledData?.peerUid) {
       // groups/friends 可能在打开后才异步加载完成，找到目标前允许本 effect 随列表更新重跑。
-      const targetList = prefilledData.chatType === 2 ? groups : friends
+      const isGroupLike = prefilledData.chatType === 2 || prefilledData.chatType === 3
+      const targetList = isGroupLike ? groups : friends
       const found = targetList.find((t) => {
-        if (prefilledData.chatType === 2) return "groupCode" in t && t.groupCode === prefilledData.peerUid
+        if (isGroupLike) return "groupCode" in t && t.groupCode === prefilledData.peerUid
         return "uid" in t && t.uid === prefilledData.peerUid
       })
       if (found) {
@@ -305,7 +306,7 @@ export function TaskWizard({
 
       const sessionName = prefilledData.sessionName?.trim()
       if (sessionName) {
-        const virtualTarget: Group | Friend = prefilledData.chatType === 2
+        const virtualTarget: Group | Friend = isGroupLike
           ? {
               groupCode: prefilledData.peerUid,
               groupName: sessionName,
@@ -1488,7 +1489,7 @@ export function TaskWizard({
                 <div className="flex flex-col items-center justify-center h-full text-center">
                   <CheckCircle className="w-12 h-12 text-[#317CFF] mb-4" />
                   <p className="text-[15px] font-medium text-foreground mb-1">
-                    已选中 1 个{form.chatType === 1 ? "好友" : "群组"}
+                    已选中 1 个{form.chatType === 1 ? "好友" : form.chatType === 3 ? "讨论组" : "群组"}
                   </p>
                   <p className="text-[13px] text-muted-foreground mb-6 max-w-[220px] truncate">
                     {"groupName" in selectedTarget
@@ -1511,7 +1512,7 @@ export function TaskWizard({
                             id: isGroup ? selectedTarget.groupCode : selectedTarget.uid,
                             name: isGroup ? selectedTarget.groupName : selectedTarget.remark || selectedTarget.nick,
                             peer: {
-                              chatType: isGroup ? 2 : 1,
+                              chatType: form.chatType,
                               peerUid: isGroup ? selectedTarget.groupCode : selectedTarget.uid,
                               backupImportId: form.backupImportId,
                             }

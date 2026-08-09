@@ -440,6 +440,7 @@ fn imported_inactive_session(
         {
             "unavailable_group"
         }
+        3 => "discussion",
         _ => return None,
     };
     let mut value = json!({
@@ -817,8 +818,15 @@ pub async fn inactive_sessions(
         .iter()
         .filter(|session| session.get("kind").and_then(Value::as_str) == Some("non_friend"))
         .count();
+    let unavailable_group_count = sessions
+        .iter()
+        .filter(|session| session.get("kind").and_then(Value::as_str) == Some("unavailable_group"))
+        .count();
+    let discussion_count = sessions
+        .iter()
+        .filter(|session| session.get("kind").and_then(Value::as_str) == Some("discussion"))
+        .count();
     let total_count = sessions.len();
-    let unavailable_group_count = total_count.saturating_sub(non_friend_count);
 
     response::success(
         json!({
@@ -826,6 +834,7 @@ pub async fn inactive_sessions(
             "totalCount": total_count,
             "nonFriendCount": non_friend_count,
             "unavailableGroupCount": unavailable_group_count,
+            "discussionCount": discussion_count,
             "rawCount": raw_count,
             "databaseRawCount": database_raw_count,
             "indexSource": loaded.source,
@@ -1040,6 +1049,18 @@ mod tests {
                 last_msg_time: Some("2020-01-02T00:00:00Z".to_string()),
                 message_count: 300,
             },
+            ImportedSession {
+                import_id: "backup-1".to_string(),
+                source_name: "nt_msg.db".to_string(),
+                format: "nt_msg_raw".to_string(),
+                chat_type: 3,
+                peer_uid: "30003".to_string(),
+                peer_uin: Some("30003".to_string()),
+                name: "讨论组 30003".to_string(),
+                avatar_url: "discussion-avatar".to_string(),
+                last_msg_time: Some("2018-01-02T00:00:00Z".to_string()),
+                message_count: 400,
+            },
         ];
 
         merge_imported_inactive_sessions(
@@ -1049,11 +1070,13 @@ mod tests {
             &active_group_codes,
         );
 
-        assert_eq!(sessions.len(), 3, "active friends must remain excluded");
+        assert_eq!(sessions.len(), 4, "active friends must remain excluded");
         assert_eq!(sessions[1]["backupImportId"], "backup-1");
         assert_eq!(sessions[1]["kind"], "non_friend");
         assert_eq!(sessions[1]["messageCount"], 200);
         assert_eq!(sessions[2]["kind"], "unavailable_group");
+        assert_eq!(sessions[3]["kind"], "discussion");
+        assert_eq!(sessions[3]["chatType"], 3);
     }
 
     #[test]

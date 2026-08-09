@@ -157,8 +157,8 @@ export interface AccountLogoutResult {
 
 /** 当前已不在好友或群列表、但 NTQQ 本机仍保留索引的历史会话。 */
 export interface InactiveSession {
-  kind: 'non_friend' | 'unavailable_group'
-  chatType: 1 | 2
+  kind: 'non_friend' | 'unavailable_group' | 'discussion'
+  chatType: 1 | 2 | 3
   peerUid: string
   peerUin?: string
   name: string
@@ -174,6 +174,7 @@ export interface InactiveSessionsResponse {
   totalCount: number
   nonFriendCount: number
   unavailableGroupCount: number
+  discussionCount: number
   rawCount: number
   databaseRawCount?: number
   indexSource?: 'full' | 'snapshot'
@@ -194,7 +195,7 @@ export interface ImportedChatSession {
   importId: string
   sourceName: string
   format: 'nt_msg_export' | 'nt_msg_raw'
-  chatType: 1 | 2
+  chatType: 1 | 2 | 3
   peerUid: string
   peerUin?: string
   name: string
@@ -231,6 +232,8 @@ export interface AccountExportPreview {
   localSessionCount: number
   warningCount: number
   warnings: Array<{ code: string; message: string }>
+  resumeAvailable?: boolean
+  completedCheckpointCount?: number
   fixedIncludes: string[]
   notice: string
 }
@@ -288,6 +291,17 @@ export interface ExportTask {
   resourceCount?: number
   missingResourceCount?: number
   warningCount?: number
+  resumedConversationCount?: number
+  resumeAvailable?: boolean
+  conversationProgress?: { completed: number; total: number }
+  resourceProgress?: {
+    total: number
+    completed: number
+    failed: number
+    current?: string
+    conversationIndex: number
+    conversationTotal: number
+  }
 }
 
 /**

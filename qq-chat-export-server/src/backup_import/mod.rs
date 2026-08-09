@@ -109,6 +109,8 @@ struct BackupManifest {
     file_size: u64,
     session_count: usize,
     message_count: u64,
+    #[serde(default)]
+    includes_discussions: bool,
 }
 
 impl From<BackupManifest> for BackupImport {
@@ -412,6 +414,7 @@ fn import_path_blocking(
             file_size: source_meta.len(),
             session_count: sessions.len(),
             message_count,
+            includes_discussions: true,
         };
         write_manifest(&import_dir, &manifest)?;
         Ok(BackupImport::from(manifest))
@@ -507,10 +510,16 @@ fn table_names(connection: &Connection) -> Result<HashSet<String>, BackupImportE
 fn detect_schema(path: &Path) -> Result<BackupSchema, BackupImportError> {
     let connection = open_read_only(path)?;
     let names = table_names(&connection)?;
-    if names.contains("c2c_messages") || names.contains("group_messages") {
+    if names.contains("c2c_messages")
+        || names.contains("group_messages")
+        || names.contains("discuss_messages")
+    {
         return Ok(BackupSchema::NtMsgExport);
     }
-    if names.contains("c2c_msg_table") || names.contains("group_msg_table") {
+    if names.contains("c2c_msg_table")
+        || names.contains("group_msg_table")
+        || names.contains("discuss_msg_table")
+    {
         return Ok(BackupSchema::NtMsgRaw);
     }
     Err(BackupImportError::UnsupportedSchema)
@@ -559,9 +568,23 @@ fn list_imports_blocking(root: &Path) -> Result<Vec<BackupImport>, BackupImportE
         let Ok(bytes) = fs::read(manifest_path(&entry.path())) else {
             continue;
         };
-        let Ok(manifest) = serde_json::from_slice::<BackupManifest>(&bytes) else {
+        let Ok(mut manifest) = serde_json::from_slice::<BackupManifest>(&bytes) else {
             continue;
         };
+        if !manifest.includes_discussions {
+            let provisional = BackupImport::from(manifest.clone());
+            if let Ok(sessions) = list_sessions_for_import(root, &provisional) {
+                manifest.session_count = sessions.len();
+                manifest.message_count = sessions.iter().map(|session| session.message_count).sum();
+                manifest.includes_discussions = true;
+                if let Err(error) = write_manifest(&entry.path(), &manifest) {
+                    tracing::warn!(
+                        "failed to persist upgraded backup manifest for {}: {error}",
+                        manifest.id
+                    );
+                }
+            }
+        }
         imports.push(BackupImport::from(manifest));
     }
     imports.sort_by(|left, right| right.created_at.cmp(&left.created_at));
@@ -594,7 +617,7 @@ fn push_session(
         return;
     }
     let identifier = peer_uin.as_deref().unwrap_or(&peer_uid);
-    let is_group = chat_type == 2;
+    let is_group_like = matches!(chat_type, 2 | 3);
     let peer_name = peer_name
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty() && name != identifier && name != &peer_uid);
@@ -606,13 +629,15 @@ fn push_session(
         peer_uid: peer_uid.clone(),
         peer_uin: peer_uin.clone(),
         name: peer_name.unwrap_or_else(|| {
-            if is_group {
+            if chat_type == 2 {
                 format!("群聊 {identifier}")
+            } else if chat_type == 3 {
+                format!("讨论组 {identifier}")
             } else {
                 format!("QQ {identifier}")
             }
         }),
-        avatar_url: if is_group {
+        avatar_url: if is_group_like {
             format!("https://p.qlogo.cn/gh/{identifier}/{identifier}/640/")
         } else {
             format!("https://q1.qlogo.cn/g?b=qq&nk={identifier}&s=640")
@@ -684,6 +709,37 @@ fn list_structured_sessions(
                 2,
                 group_code,
                 group_qq
+                    .filter(|value| *value > 0)
+                    .map(|value| value.to_string()),
+                last_time,
+                count,
+                None,
+            );
+        }
+    }
+    if names.contains("discuss_messages") {
+        let mut statement = connection.prepare(
+            "SELECT discuss_id, MAX(discuss_qq), MAX(timestamp), COUNT(*) FROM discuss_messages GROUP BY discuss_id ORDER BY MAX(timestamp) DESC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (discuss_id, discuss_qq, last_time, count) = row?;
+            let discuss_code = discuss_qq
+                .filter(|value| *value > 0)
+                .map_or_else(|| discuss_id.clone(), |value| value.to_string());
+            push_session(
+                &mut sessions,
+                import,
+                3,
+                discuss_code,
+                discuss_qq
                     .filter(|value| *value > 0)
                     .map(|value| value.to_string()),
                 last_time,
@@ -772,6 +828,34 @@ fn list_raw_sessions(
                 last_time,
                 count,
                 group_name,
+            );
+        }
+    }
+    if names.contains("discuss_msg_table") {
+        let columns = table_columns(connection, "discuss_msg_table")?;
+        let peer_number = raw_column(&columns, "40030", "0");
+        let peer_id = raw_column(&columns, "40021", "''");
+        let timestamp = raw_column(&columns, "40050", "0");
+        let peer = format!("COALESCE(NULLIF(CAST({peer_number} AS TEXT), '0'), {peer_id})");
+        let mut statement = connection.prepare(&format!(
+            "SELECT {peer}, MAX(CAST({peer_number} AS INTEGER)), MAX(CAST({timestamp} AS INTEGER)), COUNT(*) FROM discuss_msg_table GROUP BY {peer} ORDER BY MAX(CAST({timestamp} AS INTEGER)) DESC"
+        ))?;
+        let rows = statement.query_map([], aggregate_session_row)?;
+        for row in rows {
+            let (peer_uid, peer_number, last_time, count) = row?;
+            let peer_uin = peer_number
+                .filter(|value| *value > 0)
+                .map(|value| value.to_string());
+            let discuss_code = peer_uin.clone().unwrap_or(peer_uid);
+            push_session(
+                &mut sessions,
+                import,
+                3,
+                discuss_code,
+                peer_uin,
+                last_time,
+                count,
+                None,
             );
         }
     }
@@ -959,6 +1043,7 @@ fn fetch_structured_messages(
     let (table, peer_column, number_column) = match chat_type {
         1 => ("c2c_messages", "peer_uid", "peer_qq"),
         2 => ("group_messages", "group_id", "group_qq"),
+        3 => ("discuss_messages", "discuss_id", "discuss_qq"),
         _ => return Err(BackupImportError::UnsupportedChatType),
     };
     if !table_names(connection)?.contains(table) {
@@ -990,15 +1075,11 @@ fn fetch_structured_messages(
             |row| row.get(0),
         )?
     };
-    let peer_select = if chat_type == 1 {
-        "peer_uid"
-    } else {
-        "group_id"
-    };
-    let peer_number_select = if chat_type == 1 {
-        "peer_qq"
-    } else {
-        "group_qq"
+    let (peer_select, peer_number_select) = match chat_type {
+        1 => ("peer_uid", "peer_qq"),
+        2 => ("group_id", "group_qq"),
+        3 => ("discuss_id", "discuss_qq"),
+        _ => unreachable!(),
     };
     let mut query = format!(
         "SELECT msg_id, timestamp, direction, sender_uid, sender_qq, {peer_select}, {peer_number_select}, msg_type, content_type, text, content FROM {table} WHERE {condition} ORDER BY timestamp DESC, msg_id DESC"
@@ -1051,7 +1132,7 @@ fn structured_message_row(
     let text = row.get::<_, Option<String>>(9)?;
     let content = row.get::<_, Option<String>>(10)?;
     let elements = structured_elements(content.as_deref(), text.as_deref());
-    let peer = if chat_type == 2 {
+    let peer = if matches!(chat_type, 2 | 3) {
         peer_number
             .filter(|value| *value > 0)
             .map_or_else(|| requested_peer_uid.to_string(), |value| value.to_string())
@@ -1256,6 +1337,7 @@ fn fetch_raw_messages(
     let table = match chat_type {
         1 => "c2c_msg_table",
         2 => "group_msg_table",
+        3 => "discuss_msg_table",
         _ => return Err(BackupImportError::UnsupportedChatType),
     };
     if !table_names(connection)?.contains(table) {
@@ -1328,7 +1410,7 @@ fn raw_ntqq_message_row(row: &Row<'_>, chat_type: i64, requested_peer_uid: &str)
     let blob = row.get::<_, Option<Vec<u8>>>(10).unwrap_or_default();
     let peer_number = row.get::<_, i64>(11).unwrap_or_default();
     let stored_peer_uid = row.get::<_, String>(12).unwrap_or_default();
-    let peer = if chat_type == 2 && peer_number > 0 {
+    let peer = if matches!(chat_type, 2 | 3) && peer_number > 0 {
         peer_number.to_string()
     } else if stored_peer_uid.is_empty() {
         requested_peer_uid.to_string()
@@ -1739,6 +1821,12 @@ mod tests {
                     "40050" INTEGER, "40090" TEXT, "40093" TEXT,
                     "40011" INTEGER, "40012" INTEGER, "40800" BLOB
                 );
+                CREATE TABLE discuss_msg_table (
+                    "40001" INTEGER, "40003" INTEGER, "40013" INTEGER,
+                    "40020" TEXT, "40021" TEXT, "40030" INTEGER, "40033" INTEGER,
+                    "40050" INTEGER, "40090" TEXT, "40093" TEXT,
+                    "40011" INTEGER, "40012" INTEGER, "40800" BLOB
+                );
                 CREATE TABLE recent_contact_v3_table (
                     "40010" INTEGER, "40021" TEXT, "40050" INTEGER, "40094" TEXT
                 );
@@ -1765,6 +1853,12 @@ mod tests {
                 params![12_i64, 22_i64, ntqq_text_blob("退出群的历史消息")],
             )
             .expect("seed raw group");
+        connection
+            .execute(
+                r#"INSERT INTO discuss_msg_table VALUES (?1, ?2, 0, 'u_discuss_sender', 'd_old', 99887, 10002, 1700000400, '讨论组成员', '', 2, 1, ?3)"#,
+                params![14_i64, 24_i64, ntqq_text_blob("旧讨论组的历史消息")],
+            )
+            .expect("seed raw discussion");
     }
 
     #[test]
@@ -1829,7 +1923,8 @@ mod tests {
 
         let imported = import_path_blocking(&imports, &source, None, None).unwrap();
         assert_eq!(imported.format, "nt_msg_raw");
-        assert_eq!(imported.session_count, 2);
+        assert_eq!(imported.session_count, 3);
+        assert_eq!(imported.message_count, 4);
         let sessions = list_sessions_for_import(&imports, &imported).unwrap();
         let private_session = sessions
             .iter()
@@ -1845,6 +1940,12 @@ mod tests {
                 && session.peer_uid == "87654"
                 && session.name == "备份中的已退出群"
         }));
+        let discussion = sessions
+            .iter()
+            .find(|session| session.chat_type == 3 && session.peer_uid == "99887")
+            .expect("raw discussion session");
+        assert_eq!(discussion.name, "讨论组 99887");
+        assert_eq!(discussion.message_count, 1);
 
         let page = fetch_messages_blocking(
             &imports,
@@ -1878,6 +1979,49 @@ mod tests {
         .unwrap();
         assert_eq!(empty.total_count, 0);
         assert!(empty.messages.is_empty());
+
+        let discussion_page = fetch_messages_blocking(
+            &imports,
+            &imported.id,
+            3,
+            "99887",
+            1,
+            50,
+            None,
+            None,
+            Some("讨论组"),
+        )
+        .unwrap();
+        assert_eq!(discussion_page.total_count, 1);
+        assert_eq!(discussion_page.messages[0]["chatType"], 3);
+        assert_eq!(
+            discussion_page.messages[0]["elements"][0]["textElement"]["content"],
+            "旧讨论组的历史消息"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn upgrades_old_manifest_counts_to_include_discussions() {
+        let root = temp_root("manifest-discussions");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("nt_msg.db");
+        create_raw_fixture(&source);
+        let imports = root.join("imports");
+        let imported = import_path_blocking(&imports, &source, None, None).unwrap();
+        let path = manifest_path(&imports.join(&imported.id));
+        let mut legacy: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("includesDiscussions");
+        object.insert("sessionCount".to_owned(), json!(2));
+        object.insert("messageCount".to_owned(), json!(3));
+        fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let imports_list = list_imports_blocking(&imports).unwrap();
+        assert_eq!(imports_list[0].session_count, 3);
+        assert_eq!(imports_list[0].message_count, 4);
+        let upgraded: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(upgraded["includesDiscussions"], true);
         fs::remove_dir_all(root).unwrap();
     }
 

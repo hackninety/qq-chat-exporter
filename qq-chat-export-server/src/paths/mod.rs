@@ -155,6 +155,11 @@ impl PathManager {
         self.default_base_dir().join("backup-imports")
     }
 
+    /// 全账号归档的逐会话断点目录。成功封装归档后会删除对应断点。
+    pub fn account_export_checkpoints_dir(&self) -> PathBuf {
+        self.default_base_dir().join("account-export-checkpoints")
+    }
+
     /// 头像目录。
     pub fn avatars_dir(&self) -> PathBuf {
         self.exports_dir().join("avatars")
@@ -168,6 +173,7 @@ impl PathManager {
             self.resources_dir(),
             self.database_dir(),
             self.backup_imports_dir(),
+            self.account_export_checkpoints_dir(),
         ] {
             tokio::fs::create_dir_all(&dir).await?;
         }
