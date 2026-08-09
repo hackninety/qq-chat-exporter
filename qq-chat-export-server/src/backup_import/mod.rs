@@ -389,8 +389,9 @@ fn import_path_blocking(
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let is_sqlite = header_len >= 16 && &header[..16] == b"SQLite format 3\0";
     let is_ntqq_wrapped = header_len >= 40 && &header[32..40] == NTQQ_HEADER_MAGIC;
+    let is_plain_sqlite =
+        !is_ntqq_wrapped && header_len >= 16 && &header[..16] == b"SQLite format 3\0";
     let looks_legacy_bak = extension == "bak"
         && header_len >= 32
         && header[..16].iter().all(|byte| *byte == 0)
@@ -401,7 +402,7 @@ fn import_path_blocking(
     if is_ntqq_wrapped && key.as_deref().is_none_or(str::is_empty) {
         return Err(BackupImportError::KeyRequired);
     }
-    if !is_sqlite && !is_ntqq_wrapped && key.as_deref().is_none_or(str::is_empty) {
+    if !is_plain_sqlite && !is_ntqq_wrapped && key.as_deref().is_none_or(str::is_empty) {
         return Err(BackupImportError::UnsupportedFormat);
     }
 
@@ -411,7 +412,7 @@ fn import_path_blocking(
     fs::create_dir(&import_dir)?;
     let database_path = import_dir.join("database.sqlite");
     let result = (|| {
-        if is_sqlite {
+        if is_plain_sqlite {
             copy_with_skip(source, &database_path, 0)?;
         } else {
             let encrypted_path = import_dir.join("encrypted.sqlite");
@@ -2244,6 +2245,7 @@ mod tests {
         let encrypted_size = fs::metadata(&encrypted).unwrap().len();
         assert!(encrypted_size > 4096);
         let mut wrapped = vec![0_u8; NTQQ_HEADER_SIZE as usize];
+        wrapped[..16].copy_from_slice(b"SQLite format 3\0");
         wrapped[32..40].copy_from_slice(NTQQ_HEADER_MAGIC);
         wrapped.extend_from_slice(&fs::read(&encrypted).unwrap());
         let source = root.join("nt_msg.db");

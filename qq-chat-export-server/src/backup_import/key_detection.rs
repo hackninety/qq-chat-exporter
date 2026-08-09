@@ -114,8 +114,8 @@ fn inspect_sample(
     if header_len < SQLITE_MAGIC.len() {
         return Err(KeyDetectionError::InvalidSample);
     }
-    let plaintext = &header[..SQLITE_MAGIC.len()] == SQLITE_MAGIC;
     let wrapped = header_len >= 40 && &header[32..40] == NTQQ_HEADER_MAGIC;
+    let plaintext = !wrapped && &header[..SQLITE_MAGIC.len()] == SQLITE_MAGIC;
     let extension = display_name
         .and_then(|name| Path::new(name).extension())
         .and_then(|extension| extension.to_str())
@@ -361,6 +361,25 @@ mod tests {
         assert!(!detection.required);
         assert!(!detection.detected);
         assert!(detection.key.is_none());
+    }
+
+    #[test]
+    fn wrapped_ntqq_header_is_not_misclassified_as_plaintext() {
+        let sample_path = std::env::temp_dir().join(format!(
+            "qce-wrapped-key-test-{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut header = vec![0_u8; NTQQ_HEADER_SIZE as usize];
+        header[..SQLITE_MAGIC.len()].copy_from_slice(SQLITE_MAGIC);
+        header[32..40].copy_from_slice(NTQQ_HEADER_MAGIC);
+        std::fs::write(&sample_path, header).expect("write wrapped NTQQ header");
+
+        let inspection =
+            inspect_sample(&sample_path, Some("nt_msg.db")).expect("inspect wrapped NTQQ sample");
+        let _ = std::fs::remove_file(sample_path);
+
+        assert!(inspection.wrapped);
+        assert!(!inspection.plaintext);
     }
 
     #[cfg(windows)]
