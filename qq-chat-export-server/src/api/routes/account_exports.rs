@@ -303,7 +303,16 @@ async fn prepare_account_export(
                 error.code(),
             )
         })?;
-    let inventory = build_inventory(state, imported).await?;
+    let mut inventory = build_inventory(state, imported).await?;
+    if backup.recovered {
+        inventory.warnings.push(warning(
+            "source_database",
+            "SOURCE_DATABASE_RECOVERED",
+            "源数据库存在无法完整导出的页面；归档仅包含成功恢复的私聊、群聊和讨论组消息表，source/nt_msg.sqlite 不是完整源库副本".to_owned(),
+            None,
+            None,
+        ));
+    }
     if inventory.account.uin.as_deref() != Some(account_uin.as_str()) {
         return Err(ApiError::new(
             ErrorType::Auth,

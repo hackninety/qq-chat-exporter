@@ -15,7 +15,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{params, Connection, OpenFlags, Row};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -23,6 +23,20 @@ const NTQQ_HEADER_SIZE: u64 = 1024;
 const NTQQ_HEADER_MAGIC: &[u8; 8] = b"QQ_NT DB";
 const COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const OWNER_INFERENCE_VERSION: u8 = 1;
+const SUPPORTED_MESSAGE_TABLES: [&str; 6] = [
+    "c2c_messages",
+    "group_messages",
+    "discuss_messages",
+    "c2c_msg_table",
+    "group_msg_table",
+    "discuss_msg_table",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecryptCoverage {
+    Complete,
+    MessageTablesOnly,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackupImportError {
@@ -100,6 +114,7 @@ pub struct BackupImport {
     pub file_size: u64,
     pub session_count: usize,
     pub message_count: u64,
+    pub recovered: bool,
     #[serde(skip)]
     schema: BackupSchema,
 }
@@ -120,6 +135,8 @@ struct BackupManifest {
     message_count: u64,
     #[serde(default)]
     includes_discussions: bool,
+    #[serde(default)]
+    recovered: bool,
 }
 
 impl From<BackupManifest> for BackupImport {
@@ -133,6 +150,7 @@ impl From<BackupManifest> for BackupImport {
             file_size: value.file_size,
             session_count: value.session_count,
             message_count: value.message_count,
+            recovered: value.recovered,
             schema: value.schema,
         }
     }
@@ -412,6 +430,7 @@ fn import_path_blocking(
     fs::create_dir(&import_dir)?;
     let database_path = import_dir.join("database.sqlite");
     let result = (|| {
+        let mut recovered = false;
         if is_plain_sqlite {
             copy_with_skip(source, &database_path, 0)?;
         } else {
@@ -421,11 +440,11 @@ fn import_path_blocking(
                 &encrypted_path,
                 if is_ntqq_wrapped { NTQQ_HEADER_SIZE } else { 0 },
             )?;
-            decrypt_sqlcipher(
+            recovered = decrypt_sqlcipher(
                 &encrypted_path,
                 &database_path,
                 key.as_deref().ok_or(BackupImportError::KeyRequired)?,
-            )?;
+            )? == DecryptCoverage::MessageTablesOnly;
             fs::remove_file(encrypted_path)?;
         }
 
@@ -447,6 +466,7 @@ fn import_path_blocking(
             file_size: source_meta.len(),
             session_count: 0,
             message_count: 0,
+            recovered,
             schema,
         };
         let sessions = list_sessions_for_import(root, &provisional)?;
@@ -462,6 +482,7 @@ fn import_path_blocking(
             session_count: sessions.len(),
             message_count,
             includes_discussions: true,
+            recovered,
         };
         write_manifest(&import_dir, &manifest)?;
         Ok(BackupImport::from(manifest))
@@ -486,7 +507,7 @@ fn decrypt_sqlcipher(
     encrypted_path: &Path,
     plain_path: &Path,
     key: &str,
-) -> Result<(), BackupImportError> {
+) -> Result<DecryptCoverage, BackupImportError> {
     let connection = Connection::open(encrypted_path)?;
     configure_sqlcipher(&connection, key)?;
     connection
@@ -494,6 +515,25 @@ fn decrypt_sqlcipher(
             row.get::<_, i64>(0)
         })
         .map_err(|_| BackupImportError::WrongKey)?;
+    match export_complete_database(&connection, plain_path) {
+        Ok(()) => Ok(DecryptCoverage::Complete),
+        Err(error) if is_database_corruption(&error) => {
+            tracing::warn!(
+                "full SQLCipher export found corrupt pages; retrying with supported message tables"
+            );
+            drop(connection);
+            remove_sqlite_artifacts(plain_path);
+            export_supported_message_tables(encrypted_path, plain_path, key)?;
+            Ok(DecryptCoverage::MessageTablesOnly)
+        }
+        Err(error) => Err(BackupImportError::Database(error)),
+    }
+}
+
+fn export_complete_database(
+    connection: &Connection,
+    plain_path: &Path,
+) -> Result<(), rusqlite::Error> {
     let plain = plain_path.to_string_lossy().to_string();
     connection.execute("ATTACH DATABASE ?1 AS qce_plain KEY ''", params![plain])?;
     let export_result =
@@ -502,6 +542,61 @@ fn decrypt_sqlcipher(
     export_result?;
     detach_result?;
     Ok(())
+}
+
+fn export_supported_message_tables(
+    encrypted_path: &Path,
+    plain_path: &Path,
+    key: &str,
+) -> Result<(), BackupImportError> {
+    let connection = Connection::open(encrypted_path)?;
+    configure_sqlcipher(&connection, key)?;
+    let names = table_names(&connection)?;
+    let selected = SUPPORTED_MESSAGE_TABLES
+        .iter()
+        .filter(|table| names.contains(**table))
+        .copied()
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Err(BackupImportError::UnsupportedSchema);
+    }
+
+    let plain = plain_path.to_string_lossy().to_string();
+    connection.execute("ATTACH DATABASE ?1 AS qce_plain KEY ''", params![plain])?;
+    connection.execute_batch("BEGIN;")?;
+    for table in selected {
+        let identifier = format!("\"{}\"", table.replace('"', "\"\""));
+        let sql = format!(
+            "CREATE TABLE qce_plain.{identifier} AS \
+             SELECT * FROM main.{identifier} WHERE 0; \
+             INSERT INTO qce_plain.{identifier} SELECT * FROM main.{identifier};"
+        );
+        if let Err(error) = connection.execute_batch(&sql) {
+            let _ = connection.execute_batch("ROLLBACK; DETACH DATABASE qce_plain;");
+            return Err(BackupImportError::Database(error));
+        }
+    }
+    connection.execute_batch("COMMIT; DETACH DATABASE qce_plain;")?;
+    Ok(())
+}
+
+fn is_database_corruption(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == ErrorCode::DatabaseCorrupt
+    ) || error
+        .to_string()
+        .contains("database disk image is malformed")
+}
+
+fn remove_sqlite_artifacts(path: &Path) {
+    let _ = fs::remove_file(path);
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let _ = fs::remove_file(PathBuf::from(sidecar));
+    }
 }
 
 fn configure_sqlcipher(connection: &Connection, key: &str) -> Result<(), BackupImportError> {
@@ -2287,6 +2382,89 @@ mod tests {
         assert_eq!(imported.format, "nt_msg_export");
         assert_eq!(imported.session_count, 1);
         assert!(!imports.join(&imported.id).join("encrypted.sqlite").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovers_message_tables_when_an_unrelated_encrypted_page_is_corrupt() {
+        let root = temp_root("encrypted-recovery");
+        fs::create_dir_all(&root).unwrap();
+        let encrypted = root.join("encrypted.sqlite");
+        let key = "0123456789abcdef";
+        let corrupt_root_page;
+        {
+            let connection = Connection::open(&encrypted).expect("create encrypted fixture");
+            connection
+                .execute_batch(&format!(
+                    "PRAGMA cipher_page_size = 4096; PRAGMA key = '{key}'; PRAGMA kdf_iter = 4000; PRAGMA cipher_hmac_algorithm = HMAC_SHA1; PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;"
+                ))
+                .expect("configure fixture encryption");
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE c2c_messages (
+                        msg_id INTEGER PRIMARY KEY, timestamp INTEGER NOT NULL, direction INTEGER NOT NULL,
+                        sender_uid TEXT NOT NULL, sender_qq INTEGER, peer_uid TEXT NOT NULL, peer_qq INTEGER NOT NULL,
+                        msg_type INTEGER NOT NULL, content_type INTEGER, proto_ver TEXT, inner_ts INTEGER,
+                        text TEXT, content TEXT
+                    );
+                    INSERT INTO c2c_messages VALUES
+                        (1, 1700000400, 0, 'u_sender', 10001, 'u_recovered', 90909, 2, 1, NULL, NULL, '恢复消息', '{"type":"text","text":"恢复消息"}');
+                    CREATE TABLE unrelated_cache (payload BLOB NOT NULL);
+                    INSERT INTO unrelated_cache VALUES (zeroblob(8192));
+                    "#,
+                )
+                .expect("seed encrypted recovery fixture");
+            corrupt_root_page = connection
+                .query_row(
+                    "SELECT rootpage FROM sqlite_master WHERE name = 'unrelated_cache'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .expect("read unrelated table root page");
+        }
+        {
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&encrypted)
+                .expect("open encrypted fixture for corruption");
+            let offset = (corrupt_root_page - 1) * 4096 + 64;
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            let mut byte = [0_u8; 1];
+            file.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0xff;
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(&byte).unwrap();
+            file.flush().unwrap();
+        }
+
+        let mut wrapped = vec![0_u8; NTQQ_HEADER_SIZE as usize];
+        wrapped[..16].copy_from_slice(b"SQLite format 3\0");
+        wrapped[32..40].copy_from_slice(NTQQ_HEADER_MAGIC);
+        wrapped.extend_from_slice(&fs::read(&encrypted).unwrap());
+        let source = root.join("nt_msg.db");
+        fs::write(&source, wrapped).unwrap();
+        let imports = root.join("imports");
+
+        let imported = import_path_blocking(
+            &imports,
+            &source,
+            None,
+            Some(key.to_owned()),
+            "10001".to_owned(),
+        )
+        .expect("recover supported message tables");
+
+        assert!(imported.recovered);
+        assert_eq!(imported.session_count, 1);
+        assert_eq!(imported.message_count, 1);
+        let recovered = open_read_only(&imports.join(&imported.id).join("database.sqlite"))
+            .expect("open recovered database");
+        let names = table_names(&recovered).expect("list recovered tables");
+        assert!(names.contains("c2c_messages"));
+        assert!(!names.contains("unrelated_cache"));
+        drop(recovered);
         fs::remove_dir_all(root).unwrap();
     }
 

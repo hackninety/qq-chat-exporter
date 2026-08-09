@@ -190,6 +190,7 @@ export interface ChatBackupImport {
   fileSize: number
   sessionCount: number
   messageCount: number
+  recovered?: boolean
 }
 
 export interface ImportedChatSession {
