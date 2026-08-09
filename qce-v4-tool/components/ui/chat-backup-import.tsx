@@ -236,7 +236,7 @@ export function ChatBackupImportSection({
           {imports.map((item) => (
             <span key={item.id} className="rounded-full bg-black/[0.035] px-3 py-1.5 text-[11px] text-muted-foreground dark:bg-white/[0.05]">
               {item.fileName} · {item.sessionCount} 个会话 · {item.messageCount.toLocaleString()} 条
-              {item.recovered ? ' · 恢复模式（仅消息表）' : ''}
+              {item.recovered ? ` · 恢复模式（仅消息表${item.recoverySkippedSegments ? `，跳过 ${item.recoverySkippedSegments} 个损坏区段` : ''}）` : ''}
             </span>
           ))}
         </div>

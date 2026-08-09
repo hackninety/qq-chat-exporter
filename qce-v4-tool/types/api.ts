@@ -191,6 +191,7 @@ export interface ChatBackupImport {
   sessionCount: number
   messageCount: number
   recovered?: boolean
+  recoverySkippedSegments?: number
 }
 
 export interface ImportedChatSession {

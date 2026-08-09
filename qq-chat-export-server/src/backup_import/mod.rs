@@ -15,7 +15,9 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{params, Connection, ErrorCode, OpenFlags, Row};
+use rusqlite::{
+    params, params_from_iter, types::Value as SqlValue, Connection, ErrorCode, OpenFlags, Row,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -23,6 +25,7 @@ const NTQQ_HEADER_SIZE: u64 = 1024;
 const NTQQ_HEADER_MAGIC: &[u8; 8] = b"QQ_NT DB";
 const COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const OWNER_INFERENCE_VERSION: u8 = 1;
+const RECOVERY_BATCH_ROWS: i64 = 1_000;
 const SUPPORTED_MESSAGE_TABLES: [&str; 6] = [
     "c2c_messages",
     "group_messages",
@@ -32,10 +35,15 @@ const SUPPORTED_MESSAGE_TABLES: [&str; 6] = [
     "discuss_msg_table",
 ];
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MessageRecovery {
+    skipped_segments: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecryptCoverage {
     Complete,
-    MessageTablesOnly,
+    MessageTablesOnly(MessageRecovery),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -115,6 +123,7 @@ pub struct BackupImport {
     pub session_count: usize,
     pub message_count: u64,
     pub recovered: bool,
+    pub recovery_skipped_segments: usize,
     #[serde(skip)]
     schema: BackupSchema,
 }
@@ -137,6 +146,8 @@ struct BackupManifest {
     includes_discussions: bool,
     #[serde(default)]
     recovered: bool,
+    #[serde(default)]
+    recovery_skipped_segments: usize,
 }
 
 impl From<BackupManifest> for BackupImport {
@@ -151,6 +162,7 @@ impl From<BackupManifest> for BackupImport {
             session_count: value.session_count,
             message_count: value.message_count,
             recovered: value.recovered,
+            recovery_skipped_segments: value.recovery_skipped_segments,
             schema: value.schema,
         }
     }
@@ -431,6 +443,7 @@ fn import_path_blocking(
     let database_path = import_dir.join("database.sqlite");
     let result = (|| {
         let mut recovered = false;
+        let mut recovery_skipped_segments = 0;
         if is_plain_sqlite {
             copy_with_skip(source, &database_path, 0)?;
         } else {
@@ -440,11 +453,15 @@ fn import_path_blocking(
                 &encrypted_path,
                 if is_ntqq_wrapped { NTQQ_HEADER_SIZE } else { 0 },
             )?;
-            recovered = decrypt_sqlcipher(
+            let coverage = decrypt_sqlcipher(
                 &encrypted_path,
                 &database_path,
                 key.as_deref().ok_or(BackupImportError::KeyRequired)?,
-            )? == DecryptCoverage::MessageTablesOnly;
+            )?;
+            if let DecryptCoverage::MessageTablesOnly(recovery) = coverage {
+                recovered = true;
+                recovery_skipped_segments = recovery.skipped_segments;
+            }
             fs::remove_file(encrypted_path)?;
         }
 
@@ -467,6 +484,7 @@ fn import_path_blocking(
             session_count: 0,
             message_count: 0,
             recovered,
+            recovery_skipped_segments,
             schema,
         };
         let sessions = list_sessions_for_import(root, &provisional)?;
@@ -483,6 +501,7 @@ fn import_path_blocking(
             message_count,
             includes_discussions: true,
             recovered,
+            recovery_skipped_segments,
         };
         write_manifest(&import_dir, &manifest)?;
         Ok(BackupImport::from(manifest))
@@ -523,8 +542,8 @@ fn decrypt_sqlcipher(
             );
             drop(connection);
             remove_sqlite_artifacts(plain_path);
-            export_supported_message_tables(encrypted_path, plain_path, key)?;
-            Ok(DecryptCoverage::MessageTablesOnly)
+            let recovery = export_supported_message_tables(encrypted_path, plain_path, key)?;
+            Ok(DecryptCoverage::MessageTablesOnly(recovery))
         }
         Err(error) => Err(BackupImportError::Database(error)),
     }
@@ -548,7 +567,7 @@ fn export_supported_message_tables(
     encrypted_path: &Path,
     plain_path: &Path,
     key: &str,
-) -> Result<(), BackupImportError> {
+) -> Result<MessageRecovery, BackupImportError> {
     let connection = Connection::open(encrypted_path)?;
     configure_sqlcipher(&connection, key)?;
     let names = table_names(&connection)?;
@@ -560,24 +579,256 @@ fn export_supported_message_tables(
     if selected.is_empty() {
         return Err(BackupImportError::UnsupportedSchema);
     }
+    drop(connection);
 
-    let plain = plain_path.to_string_lossy().to_string();
-    connection.execute("ATTACH DATABASE ?1 AS qce_plain KEY ''", params![plain])?;
-    connection.execute_batch("BEGIN;")?;
+    let mut recovery = MessageRecovery::default();
     for table in selected {
-        let identifier = format!("\"{}\"", table.replace('"', "\"\""));
-        let sql = format!(
-            "CREATE TABLE qce_plain.{identifier} AS \
-             SELECT * FROM main.{identifier} WHERE 0; \
-             INSERT INTO qce_plain.{identifier} SELECT * FROM main.{identifier};"
-        );
-        if let Err(error) = connection.execute_batch(&sql) {
-            let _ = connection.execute_batch("ROLLBACK; DETACH DATABASE qce_plain;");
-            return Err(BackupImportError::Database(error));
+        match copy_message_table(encrypted_path, plain_path, key, table) {
+            Ok(()) => {}
+            Err(BackupImportError::Database(error)) if is_database_corruption(&error) => {
+                tracing::warn!(
+                    table,
+                    "message table contains corrupt pages; switching to segmented recovery"
+                );
+                drop_plain_table(plain_path, table)?;
+                let table_recovery = recover_message_table(encrypted_path, plain_path, key, table)?;
+                recovery.skipped_segments += table_recovery.skipped_segments;
+            }
+            Err(error) => return Err(error),
         }
     }
-    connection.execute_batch("COMMIT; DETACH DATABASE qce_plain;")?;
+    Ok(recovery)
+}
+
+fn copy_message_table(
+    encrypted_path: &Path,
+    plain_path: &Path,
+    key: &str,
+    table: &str,
+) -> Result<(), BackupImportError> {
+    let connection = Connection::open(encrypted_path)?;
+    configure_sqlcipher(&connection, key)?;
+    let plain = plain_path.to_string_lossy().to_string();
+    let identifier = quote_identifier(table);
+    connection.execute("ATTACH DATABASE ?1 AS qce_plain KEY ''", params![plain])?;
+    let result = connection.execute_batch(&format!(
+        "BEGIN; \
+         CREATE TABLE qce_plain.{identifier} AS SELECT * FROM main.{identifier} WHERE 0; \
+         INSERT INTO qce_plain.{identifier} SELECT * FROM main.{identifier}; \
+         COMMIT;"
+    ));
+    if result.is_err() {
+        let _ = connection.execute_batch("ROLLBACK;");
+    }
+    let _ = connection.execute_batch("DETACH DATABASE qce_plain;");
+    result.map_err(BackupImportError::Database)
+}
+
+fn recover_message_table(
+    encrypted_path: &Path,
+    plain_path: &Path,
+    key: &str,
+    table: &str,
+) -> Result<MessageRecovery, BackupImportError> {
+    create_empty_plain_table(encrypted_path, plain_path, key, table)?;
+    let source = Connection::open(encrypted_path)?;
+    configure_sqlcipher(&source, key)?;
+    let mut destination = Connection::open(plain_path)?;
+    let identifier = quote_identifier(table);
+    let column_count = source
+        .prepare(&format!("SELECT * FROM {identifier} LIMIT 0"))?
+        .column_count();
+    if column_count == 0 {
+        return Ok(MessageRecovery::default());
+    }
+
+    let placeholders = (1..=column_count)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let insert_sql = format!("INSERT INTO {identifier} VALUES ({placeholders})");
+    let mut cursor = None;
+    let mut recovery = MessageRecovery::default();
+
+    loop {
+        let (values, last_rowid, scan_error) =
+            read_recovery_batch(&source, table, cursor, column_count)?;
+        if !values.is_empty() {
+            insert_recovery_batch(&mut destination, &insert_sql, values)?;
+        }
+        if let Some(last_rowid) = last_rowid {
+            cursor = Some(last_rowid);
+        }
+
+        match scan_error {
+            None => {
+                if last_rowid.is_none() {
+                    break;
+                }
+            }
+            Some(error) if is_database_corruption(&error) => {
+                let resume = find_recovery_resume_rowid(&source, table, cursor)?;
+                recovery.skipped_segments += 1;
+                tracing::warn!(
+                    table,
+                    after_rowid = ?cursor,
+                    resume_rowid = ?resume,
+                    "skipped an unreadable message-table segment"
+                );
+                let Some(resume) = resume else {
+                    break;
+                };
+                cursor = Some(resume.saturating_sub(1));
+            }
+            Some(error) => return Err(BackupImportError::Database(error)),
+        }
+    }
+
+    Ok(recovery)
+}
+
+type RecoveryBatch = (Vec<Vec<SqlValue>>, Option<i64>, Option<rusqlite::Error>);
+
+fn read_recovery_batch(
+    source: &Connection,
+    table: &str,
+    after_rowid: Option<i64>,
+    column_count: usize,
+) -> Result<RecoveryBatch, BackupImportError> {
+    let identifier = quote_identifier(table);
+    let sql = after_rowid.map_or_else(
+        || format!("SELECT rowid, * FROM {identifier} ORDER BY rowid LIMIT ?1"),
+        |_| format!("SELECT rowid, * FROM {identifier} WHERE rowid > ?1 ORDER BY rowid LIMIT ?2"),
+    );
+    let mut statement = source.prepare(&sql)?;
+    let mut rows = match after_rowid {
+        Some(rowid) => statement.query(params![rowid, RECOVERY_BATCH_ROWS])?,
+        None => statement.query(params![RECOVERY_BATCH_ROWS])?,
+    };
+    let mut values = Vec::with_capacity(RECOVERY_BATCH_ROWS as usize);
+    let mut last_rowid = None;
+    let mut scan_error = None;
+    loop {
+        match rows.next() {
+            Ok(Some(row)) => {
+                last_rowid = Some(row.get::<_, i64>(0)?);
+                let mut row_values = Vec::with_capacity(column_count);
+                for column in 0..column_count {
+                    row_values.push(row.get::<_, SqlValue>(column + 1)?);
+                }
+                values.push(row_values);
+            }
+            Ok(None) => break,
+            Err(error) => {
+                scan_error = Some(error);
+                break;
+            }
+        }
+    }
+    Ok((values, last_rowid, scan_error))
+}
+
+fn insert_recovery_batch(
+    destination: &mut Connection,
+    insert_sql: &str,
+    values: Vec<Vec<SqlValue>>,
+) -> Result<(), BackupImportError> {
+    let transaction = destination.transaction()?;
+    {
+        let mut statement = transaction.prepare_cached(insert_sql)?;
+        for row in values {
+            statement.execute(params_from_iter(row))?;
+        }
+    }
+    transaction.commit()?;
     Ok(())
+}
+
+fn find_recovery_resume_rowid(
+    source: &Connection,
+    table: &str,
+    after_rowid: Option<i64>,
+) -> Result<Option<i64>, BackupImportError> {
+    let failed_lower = after_rowid.unwrap_or(0).saturating_add(1);
+    let mut failed = failed_lower;
+    let mut step = 1_i128;
+    let mut successful = None;
+
+    for _ in 0..64 {
+        let candidate = (i128::from(failed_lower) + step).min(i128::from(i64::MAX)) as i64;
+        match probe_next_rowid(source, table, candidate) {
+            Ok(result) => {
+                successful = Some((candidate, result));
+                break;
+            }
+            Err(error) if is_database_corruption(&error) => failed = candidate,
+            Err(error) => return Err(BackupImportError::Database(error)),
+        }
+        if candidate == i64::MAX {
+            break;
+        }
+        step = step.saturating_mul(2);
+    }
+
+    let Some((mut readable, mut readable_result)) = successful else {
+        return Ok(None);
+    };
+    while i128::from(readable) - i128::from(failed) > 1 {
+        let midpoint = ((i128::from(readable) + i128::from(failed)) / 2) as i64;
+        match probe_next_rowid(source, table, midpoint) {
+            Ok(result) => {
+                readable = midpoint;
+                readable_result = result;
+            }
+            Err(error) if is_database_corruption(&error) => failed = midpoint,
+            Err(error) => return Err(BackupImportError::Database(error)),
+        }
+    }
+    Ok(readable_result)
+}
+
+fn probe_next_rowid(
+    source: &Connection,
+    table: &str,
+    lower_bound: i64,
+) -> Result<Option<i64>, rusqlite::Error> {
+    let identifier = quote_identifier(table);
+    let mut statement = source.prepare(&format!(
+        "SELECT rowid FROM {identifier} WHERE rowid >= ?1 ORDER BY rowid LIMIT 1"
+    ))?;
+    let mut rows = statement.query(params![lower_bound])?;
+    rows.next()?.map(|row| row.get::<_, i64>(0)).transpose()
+}
+
+fn create_empty_plain_table(
+    encrypted_path: &Path,
+    plain_path: &Path,
+    key: &str,
+    table: &str,
+) -> Result<(), BackupImportError> {
+    let connection = Connection::open(encrypted_path)?;
+    configure_sqlcipher(&connection, key)?;
+    let plain = plain_path.to_string_lossy().to_string();
+    let identifier = quote_identifier(table);
+    connection.execute("ATTACH DATABASE ?1 AS qce_plain KEY ''", params![plain])?;
+    connection.execute_batch(&format!(
+        "CREATE TABLE qce_plain.{identifier} AS SELECT * FROM main.{identifier} WHERE 0;"
+    ))?;
+    connection.execute_batch("DETACH DATABASE qce_plain;")?;
+    Ok(())
+}
+
+fn drop_plain_table(plain_path: &Path, table: &str) -> Result<(), BackupImportError> {
+    let connection = Connection::open(plain_path)?;
+    connection.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {};",
+        quote_identifier(table)
+    ))?;
+    Ok(())
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn is_database_corruption(error: &rusqlite::Error) -> bool {
@@ -2464,6 +2715,107 @@ mod tests {
         let names = table_names(&recovered).expect("list recovered tables");
         assert!(names.contains("c2c_messages"));
         assert!(!names.contains("unrelated_cache"));
+        drop(recovered);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn skips_an_unreadable_message_table_without_failing_the_import() {
+        let root = temp_root("encrypted-message-recovery");
+        fs::create_dir_all(&root).unwrap();
+        let encrypted = root.join("encrypted.sqlite");
+        let key = "0123456789abcdef";
+        let corrupt_root_page;
+        {
+            let connection = Connection::open(&encrypted).expect("create encrypted fixture");
+            connection
+                .execute_batch(&format!(
+                    "PRAGMA cipher_page_size = 4096; PRAGMA key = '{key}'; PRAGMA kdf_iter = 4000; PRAGMA cipher_hmac_algorithm = HMAC_SHA1; PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;"
+                ))
+                .expect("configure fixture encryption");
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE c2c_messages (
+                        msg_id INTEGER PRIMARY KEY, timestamp INTEGER NOT NULL, direction INTEGER NOT NULL,
+                        sender_uid TEXT NOT NULL, sender_qq INTEGER, peer_uid TEXT NOT NULL, peer_qq INTEGER NOT NULL,
+                        msg_type INTEGER NOT NULL, content_type INTEGER, proto_ver TEXT, inner_ts INTEGER,
+                        text TEXT, content TEXT
+                    );
+                    CREATE TABLE group_messages (
+                        msg_id INTEGER PRIMARY KEY, timestamp INTEGER NOT NULL, direction INTEGER NOT NULL,
+                        sender_uid TEXT NOT NULL, sender_qq INTEGER, group_id TEXT NOT NULL, group_qq INTEGER NOT NULL,
+                        msg_type INTEGER NOT NULL, subtype INTEGER, content_type INTEGER, text TEXT,
+                        parse_status TEXT NOT NULL, content TEXT
+                    );
+                    INSERT INTO c2c_messages VALUES
+                        (1, 1700000400, 0, 'u_sender', 10001, 'u_corrupt', 90909, 2, 1, NULL, NULL, 'unreadable', '{}');
+                    INSERT INTO group_messages VALUES
+                        (2, 1700000500, 0, 'u_sender', 10001, 'g_recovered', 80808, 2, 1, 1, 'recovered', 'typed', '{}');
+                    "#,
+                )
+                .expect("seed encrypted recovery fixture");
+            corrupt_root_page = connection
+                .query_row(
+                    "SELECT rootpage FROM sqlite_master WHERE name = 'c2c_messages'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .expect("read corrupt message table root page");
+        }
+        {
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&encrypted)
+                .expect("open encrypted fixture for corruption");
+            let offset = (corrupt_root_page - 1) * 4096 + 64;
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            let mut byte = [0_u8; 1];
+            file.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0xff;
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(&byte).unwrap();
+            file.flush().unwrap();
+        }
+
+        let mut wrapped = vec![0_u8; NTQQ_HEADER_SIZE as usize];
+        wrapped[..16].copy_from_slice(b"SQLite format 3\0");
+        wrapped[32..40].copy_from_slice(NTQQ_HEADER_MAGIC);
+        wrapped.extend_from_slice(&fs::read(&encrypted).unwrap());
+        let source = root.join("nt_msg.db");
+        fs::write(&source, wrapped).unwrap();
+        let imports = root.join("imports");
+
+        let imported = import_path_blocking(
+            &imports,
+            &source,
+            None,
+            Some(key.to_owned()),
+            "10001".to_owned(),
+        )
+        .expect("recover remaining readable message tables");
+
+        assert!(imported.recovered);
+        assert_eq!(imported.recovery_skipped_segments, 1);
+        assert_eq!(imported.session_count, 1);
+        assert_eq!(imported.message_count, 1);
+        let recovered = open_read_only(&imports.join(&imported.id).join("database.sqlite"))
+            .expect("open recovered database");
+        assert_eq!(
+            recovered
+                .query_row("SELECT COUNT(*) FROM c2c_messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            recovered
+                .query_row("SELECT COUNT(*) FROM group_messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
         drop(recovered);
         fs::remove_dir_all(root).unwrap();
     }

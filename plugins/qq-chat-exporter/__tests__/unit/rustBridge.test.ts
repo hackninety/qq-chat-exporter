@@ -10,6 +10,7 @@ import {
     buildAuthUrl,
     buildBrowserOpenCommand,
     createNapCatBridge,
+    disableBrokenPacketBackend,
     parseWindowsListeningPids,
     readAccessTokenWithRetry,
     readAutoOpenBrowserSetting,
@@ -31,6 +32,28 @@ test('bridge JSON preserves nested Map, Set and bigint values', () => {
         infos: { u_1: { uin: '10001' } },
         roles: ['owner', 'admin']
     });
+});
+
+test('bridge disables a Packet backend that advertises availability without FetchRkey', () => {
+    const warnings: string[] = [];
+    const broken = {
+        apis: { PacketApi: { packetStatus: true, pkt: {} } },
+        context: { logger: { logWarn: (message: string) => warnings.push(message) } }
+    };
+    assert.equal(disableBrokenPacketBackend(broken), true);
+    assert.equal(broken.apis.PacketApi.packetStatus, false);
+    assert.equal(warnings.length, 1);
+
+    const healthy = {
+        apis: {
+            PacketApi: {
+                packetStatus: true,
+                pkt: { operation: { FetchRkey() {} } }
+            }
+        }
+    };
+    assert.equal(disableBrokenPacketBackend(healthy), false);
+    assert.equal(healthy.apis.PacketApi.packetStatus, true);
 });
 
 test('bridge uses the reserved QCE port unless explicitly overridden', () => {

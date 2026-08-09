@@ -111,6 +111,21 @@ export function bridgeJsonReplacer(_key, value) {
   return value;
 }
 
+export function disableBrokenPacketBackend(core) {
+  const packetApi = core?.apis?.PacketApi;
+  if (
+    packetApi?.packetStatus === true &&
+    typeof packetApi?.pkt?.operation?.FetchRkey !== 'function'
+  ) {
+    packetApi.packetStatus = false;
+    core?.context?.logger?.logWarn?.(
+      '[qce] NapCat Packet backend is incomplete; disabled Packet mode and kept fallback media URLs'
+    );
+    return true;
+  }
+  return false;
+}
+
 function runtimeDir() {
   return path.dirname(fileURLToPath(import.meta.url));
 }
@@ -294,6 +309,7 @@ export function findRustServerBinary() {
 }
 
 export async function createNapCatBridge(core, port = resolveBridgePort(), recovery = {}) {
+  disableBrokenPacketBackend(core);
   const reclaimPort = recovery.reclaimPort ?? DEFAULT_BRIDGE_PORT;
   const terminateOwners = recovery.terminatePortOwners ?? terminatePortOwners;
   let requestId = 0;

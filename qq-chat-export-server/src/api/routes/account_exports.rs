@@ -308,7 +308,10 @@ async fn prepare_account_export(
         inventory.warnings.push(warning(
             "source_database",
             "SOURCE_DATABASE_RECOVERED",
-            "源数据库存在无法完整导出的页面；归档仅包含成功恢复的私聊、群聊和讨论组消息表，source/nt_msg.sqlite 不是完整源库副本".to_owned(),
+            format!(
+                "源数据库存在无法完整导出的页面；归档仅包含成功恢复的私聊、群聊和讨论组消息表，跳过了 {} 个无法读取的消息区段，source/nt_msg.sqlite 不是完整源库副本",
+                backup.recovery_skipped_segments
+            ),
             None,
             None,
         ));
