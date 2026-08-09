@@ -19,7 +19,7 @@ use qce_exporter::types::{CancellationToken, ChatInfo, CleanMessage, MessageReso
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::api::helpers::backfill_self_sender_names;
+use crate::api::helpers::{backfill_self_sender_names, current_account_uin};
 use crate::api::http_security::http_download_to_file;
 use crate::api::response::{self, ApiError, ErrorType, RequestId};
 use crate::api::routes::albums::{fetch_album_list, fetch_album_media};
@@ -154,7 +154,7 @@ pub async fn preview_account_export(
                     "消息媒体、头像和表情包",
                     "可访问群的群文件和群相册",
                 ],
-                "notice": "所选已解密备份将关联到当前登录账号；导出阶段不再次校验数据库所属账号。",
+                "notice": "所选备份已按当前登录 QQ 账号隔离并校验归属；切换账号后不会读取或导出其他账号的备份。",
             }),
             &request_id,
         ),
@@ -268,9 +268,10 @@ async fn prepare_account_export(
             "BACKUP_IMPORT_REQUIRED",
         ));
     }
+    let account_uin = current_account_uin(&state.napcat).await?;
     let backup = state
         .backup_import_manager
-        .get_import(request.backup_import_id.clone())
+        .get_import(account_uin.clone(), request.backup_import_id.clone())
         .await
         .map_err(|error| {
             ApiError::new(
@@ -282,7 +283,7 @@ async fn prepare_account_export(
         })?;
     let source_database_path = state
         .backup_import_manager
-        .decrypted_database_path(request.backup_import_id.clone())
+        .decrypted_database_path(account_uin.clone(), request.backup_import_id.clone())
         .await
         .map_err(|error| {
             ApiError::new(
@@ -293,7 +294,7 @@ async fn prepare_account_export(
         })?;
     let imported = state
         .backup_import_manager
-        .list_sessions_for_import(request.backup_import_id.clone())
+        .list_sessions_for_import(account_uin.clone(), request.backup_import_id.clone())
         .await
         .map_err(|error| {
             ApiError::new(
@@ -303,6 +304,14 @@ async fn prepare_account_export(
             )
         })?;
     let inventory = build_inventory(state, imported).await?;
+    if inventory.account.uin.as_deref() != Some(account_uin.as_str()) {
+        return Err(ApiError::new(
+            ErrorType::Auth,
+            "导出预检期间登录账号发生变化，请重新打开导出窗口",
+            "ACCOUNT_CHANGED_DURING_EXPORT_PREVIEW",
+        )
+        .with_status(axum::http::StatusCode::CONFLICT));
+    }
     let checkpoint_dir = account_checkpoint_dir(
         &state.path_manager.account_export_checkpoints_dir(),
         &request.backup_import_id,
@@ -923,6 +932,7 @@ async fn process_account_export(
             match state
                 .backup_import_manager
                 .fetch_all_messages(
+                    prepared.backup.account_uin.clone(),
                     request.backup_import_id.clone(),
                     session.chat_type,
                     backup_peer.clone(),

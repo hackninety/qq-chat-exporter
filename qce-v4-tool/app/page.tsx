@@ -237,24 +237,6 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
   const [isAccountExportDialogOpen, setIsAccountExportDialogOpen] = useState(false)
   const [isLoggingOut, setIsLoggingOut] = useState(false)
 
-  const {
-    data: inactiveSessionsData,
-    loading: inactiveSessionsLoading,
-    error: inactiveSessionsError,
-    loadInactiveSessions,
-  } = useInactiveSessions()
-  const {
-    imports: chatBackupImports,
-    loading: chatBackupsLoading,
-    importing: chatBackupImporting,
-    detectingKey: chatBackupDetectingKey,
-    error: chatBackupsError,
-    loaded: chatBackupsLoaded,
-    loadBackups: loadChatBackups,
-    detectKey: detectChatBackupKey,
-    importFile: importChatBackupFile,
-  } = useChatBackups()
-  
   // 定时备份合并状态
   const [isScheduledMergeDialogOpen, setIsScheduledMergeDialogOpen] = useState(false)
   const [scheduledTasks, setScheduledTasks] = useState<Array<any>>([])
@@ -499,6 +481,26 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
     isJsonlExport,
     openTaskFileLocation,
   } = useQCE({ onNotification: handleQceNotification })
+  const currentAccountUin = systemInfo?.napcat.selfInfo?.uin
+
+  const {
+    data: inactiveSessionsData,
+    loading: inactiveSessionsLoading,
+    error: inactiveSessionsError,
+    loadInactiveSessions,
+  } = useInactiveSessions(currentAccountUin)
+
+  const {
+    imports: chatBackupImports,
+    loading: chatBackupsLoading,
+    importing: chatBackupImporting,
+    detectingKey: chatBackupDetectingKey,
+    error: chatBackupsError,
+    loaded: chatBackupsLoaded,
+    loadBackups: loadChatBackups,
+    detectKey: detectChatBackupKey,
+    importFile: importChatBackupFile,
+  } = useChatBackups(currentAccountUin)
 
   const handleLogoutAccount = useCallback(async () => {
     const confirmed = window.confirm(
@@ -1367,21 +1369,16 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
   const isStandalone = systemInfo?.mode === "standalone"
 
   useEffect(() => {
-    if (isStandalone) return
+    if (isStandalone || !currentAccountUin) return
     if (activeTab === "sessions" && groups.length === 0 && friends.length === 0) {
       loadChatData()
     }
-  }, [activeTab, groups.length, friends.length, loadChatData, isStandalone])
+  }, [activeTab, currentAccountUin, groups.length, friends.length, loadChatData, isStandalone])
 
   useEffect(() => {
     if (!systemInfo || isStandalone || activeTab !== "inactive" || inactiveSessionsData) return
     loadInactiveSessions()
   }, [activeTab, inactiveSessionsData, isStandalone, loadInactiveSessions, systemInfo])
-
-  useEffect(() => {
-    if (!systemInfo || isStandalone || activeTab !== "inactive" || chatBackupsLoaded) return
-    loadChatBackups()
-  }, [activeTab, chatBackupsLoaded, isStandalone, loadChatBackups, systemInfo])
 
   useEffect(() => {
     if (!error) return
@@ -2234,6 +2231,7 @@ export default function QCEDashboard({ initialTab }: { initialTab?: string } = {
                       onManualLookup={() => handleOpenTaskWizard()}
                     />
                     <ChatBackupImportSection
+                      accountUin={currentAccountUin}
                       imports={chatBackupImports}
                       loading={chatBackupsLoading}
                       importing={chatBackupImporting}

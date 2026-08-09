@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import type {
   APIResponse,
   ChatBackupImport,
@@ -12,7 +12,7 @@ function responseError(result: APIResponse<unknown>, fallback: string): string {
   return result.error?.message || fallback
 }
 
-export function useChatBackups() {
+export function useChatBackups(accountUin?: string) {
   const [imports, setImports] = useState<ChatBackupImport[]>([])
   const [loading, setLoading] = useState(false)
   const [importing, setImporting] = useState(false)
@@ -20,8 +20,15 @@ export function useChatBackups() {
   const [error, setError] = useState<string | null>(null)
   const [loaded, setLoaded] = useState(false)
   const keyDetectionCount = useRef(0)
+  const accountUinRef = useRef(accountUin)
 
   const loadBackups = useCallback(async () => {
+    const requestedAccountUin = accountUinRef.current
+    if (!requestedAccountUin) {
+      setImports([])
+      setLoaded(false)
+      return
+    }
     setLoading(true)
     setError(null)
     try {
@@ -30,14 +37,27 @@ export function useChatBackups() {
       if (!importsResponse.ok || !importsResult.success || !importsResult.data) {
         throw new Error(responseError(importsResult, "读取已导入备份失败"))
       }
-      setImports(importsResult.data.imports || [])
-      setLoaded(true)
+      if (accountUinRef.current === requestedAccountUin) {
+        setImports(importsResult.data.imports || [])
+        setLoaded(true)
+      }
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "读取聊天记录备份失败")
+      if (accountUinRef.current === requestedAccountUin) {
+        setError(loadError instanceof Error ? loadError.message : "读取聊天记录备份失败")
+      }
     } finally {
-      setLoading(false)
+      if (accountUinRef.current === requestedAccountUin) setLoading(false)
     }
   }, [])
+
+  useEffect(() => {
+    accountUinRef.current = accountUin
+    setImports([])
+    setLoaded(false)
+    setError(null)
+    setLoading(Boolean(accountUin))
+    if (accountUin) void loadBackups()
+  }, [accountUin, loadBackups])
 
   const importFile = useCallback(async (file: File, key?: string) => {
     setImporting(true)

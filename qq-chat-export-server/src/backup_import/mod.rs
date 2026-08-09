@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 const NTQQ_HEADER_SIZE: u64 = 1024;
 const NTQQ_HEADER_MAGIC: &[u8; 8] = b"QQ_NT DB";
 const COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+const OWNER_INFERENCE_VERSION: u8 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackupImportError {
@@ -47,6 +48,8 @@ pub enum BackupImportError {
     NotFound,
     #[error("聊天类型不受支持")]
     UnsupportedChatType,
+    #[error("所选数据库属于 QQ {detected}，与当前登录账号 QQ {current} 不一致")]
+    AccountMismatch { detected: String, current: String },
 }
 
 impl BackupImportError {
@@ -64,6 +67,7 @@ impl BackupImportError {
             Self::Manifest(_) => "BACKUP_MANIFEST_INVALID",
             Self::NotFound => "BACKUP_IMPORT_NOT_FOUND",
             Self::UnsupportedChatType => "UNSUPPORTED_CHAT_TYPE",
+            Self::AccountMismatch { .. } => "BACKUP_ACCOUNT_MISMATCH",
         }
     }
 }
@@ -89,6 +93,7 @@ impl BackupSchema {
 #[serde(rename_all = "camelCase")]
 pub struct BackupImport {
     pub id: String,
+    pub account_uin: String,
     pub file_name: String,
     pub format: String,
     pub created_at: String,
@@ -103,6 +108,10 @@ pub struct BackupImport {
 #[serde(rename_all = "camelCase")]
 struct BackupManifest {
     id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_uin: Option<String>,
+    #[serde(default)]
+    owner_inference_version: u8,
     file_name: String,
     schema: BackupSchema,
     created_at: String,
@@ -117,6 +126,7 @@ impl From<BackupManifest> for BackupImport {
     fn from(value: BackupManifest) -> Self {
         Self {
             id: value.id,
+            account_uin: value.account_uin.unwrap_or_default(),
             file_name: value.file_name,
             format: value.schema.label().to_string(),
             created_at: value.created_at,
@@ -181,11 +191,14 @@ impl BackupImportManager {
         source: PathBuf,
         display_name: Option<String>,
         key: Option<String>,
+        account_uin: String,
     ) -> Result<BackupImport, BackupImportError> {
         let root = self.root.clone();
-        tokio::task::spawn_blocking(move || import_path_blocking(&root, &source, display_name, key))
-            .await
-            .map_err(std::io::Error::other)?
+        tokio::task::spawn_blocking(move || {
+            import_path_blocking(&root, &source, display_name, key, account_uin)
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 
     pub async fn detect_key(
@@ -197,15 +210,27 @@ impl BackupImportManager {
         key_detection::detect_key(sample, display_name, original_size).await
     }
 
-    pub async fn list_imports(&self) -> Result<Vec<BackupImport>, BackupImportError> {
+    pub async fn list_imports(
+        &self,
+        account_uin: String,
+    ) -> Result<Vec<BackupImport>, BackupImportError> {
         let root = self.root.clone();
-        tokio::task::spawn_blocking(move || list_imports_blocking(&root))
-            .await
-            .map_err(std::io::Error::other)?
+        tokio::task::spawn_blocking(move || {
+            Ok(list_imports_blocking(&root)?
+                .into_iter()
+                .filter(|import| import.account_uin == account_uin)
+                .collect())
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 
-    pub async fn get_import(&self, import_id: String) -> Result<BackupImport, BackupImportError> {
-        let imports = self.list_imports().await?;
+    pub async fn get_import(
+        &self,
+        account_uin: String,
+        import_id: String,
+    ) -> Result<BackupImport, BackupImportError> {
+        let imports = self.list_imports(account_uin).await?;
         imports
             .into_iter()
             .find(|import| import.id == import_id)
@@ -214,9 +239,10 @@ impl BackupImportManager {
 
     pub async fn list_sessions_for_import(
         &self,
+        account_uin: String,
         import_id: String,
     ) -> Result<Vec<ImportedSession>, BackupImportError> {
-        let import = self.get_import(import_id).await?;
+        let import = self.get_import(account_uin, import_id).await?;
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || list_sessions_for_import(&root, &import))
             .await
@@ -225,9 +251,10 @@ impl BackupImportManager {
 
     pub async fn decrypted_database_path(
         &self,
+        account_uin: String,
         import_id: String,
     ) -> Result<PathBuf, BackupImportError> {
-        let import = self.get_import(import_id.clone()).await?;
+        let import = self.get_import(account_uin, import_id.clone()).await?;
         let path = self.root.join(&import.id).join("database.sqlite");
         let metadata = tokio::fs::metadata(&path)
             .await
@@ -238,8 +265,11 @@ impl BackupImportManager {
         Ok(path)
     }
 
-    pub async fn list_sessions(&self) -> Result<Vec<ImportedSession>, BackupImportError> {
-        let imports = self.list_imports().await?;
+    pub async fn list_sessions(
+        &self,
+        account_uin: String,
+    ) -> Result<Vec<ImportedSession>, BackupImportError> {
+        let imports = self.list_imports(account_uin).await?;
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || {
             let mut sessions = Vec::new();
@@ -256,6 +286,7 @@ impl BackupImportManager {
     #[allow(clippy::too_many_arguments)]
     pub async fn fetch_messages(
         &self,
+        account_uin: String,
         import_id: String,
         chat_type: i64,
         peer_uid: String,
@@ -265,6 +296,7 @@ impl BackupImportManager {
         end_time_ms: Option<i64>,
         search: Option<String>,
     ) -> Result<ImportedMessagesPage, BackupImportError> {
+        self.get_import(account_uin, import_id.clone()).await?;
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || {
             fetch_messages_blocking(
@@ -285,12 +317,14 @@ impl BackupImportManager {
 
     pub async fn fetch_all_messages(
         &self,
+        account_uin: String,
         import_id: String,
         chat_type: i64,
         peer_uid: String,
         start_time_ms: Option<i64>,
         end_time_ms: Option<i64>,
     ) -> Result<Vec<Value>, BackupImportError> {
+        self.get_import(account_uin, import_id.clone()).await?;
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || {
             fetch_all_messages_blocking(
@@ -336,6 +370,7 @@ fn import_path_blocking(
     source: &Path,
     display_name: Option<String>,
     key: Option<String>,
+    account_uin: String,
 ) -> Result<BackupImport, BackupImportError> {
     let source_meta = fs::metadata(source).map_err(|_| BackupImportError::InvalidSource)?;
     if !source_meta.is_file() {
@@ -394,8 +429,17 @@ fn import_path_blocking(
         }
 
         let schema = detect_schema(&database_path)?;
+        if let Some(detected) = detect_backup_account_uin(&database_path, schema)? {
+            if detected != account_uin {
+                return Err(BackupImportError::AccountMismatch {
+                    detected,
+                    current: account_uin,
+                });
+            }
+        }
         let provisional = BackupImport {
             id: id.clone(),
+            account_uin: account_uin.clone(),
             file_name: file_name.clone(),
             format: schema.label().to_string(),
             created_at: now_iso(),
@@ -408,6 +452,8 @@ fn import_path_blocking(
         let message_count = sessions.iter().map(|session| session.message_count).sum();
         let manifest = BackupManifest {
             id: id.clone(),
+            account_uin: Some(account_uin),
+            owner_inference_version: OWNER_INFERENCE_VERSION,
             file_name: file_name.clone(),
             schema,
             created_at: provisional.created_at,
@@ -525,6 +571,55 @@ fn detect_schema(path: &Path) -> Result<BackupSchema, BackupImportError> {
     Err(BackupImportError::UnsupportedSchema)
 }
 
+fn detect_backup_account_uin(
+    path: &Path,
+    schema: BackupSchema,
+) -> Result<Option<String>, BackupImportError> {
+    let connection = open_read_only(path)?;
+    let names = table_names(&connection)?;
+    let tables: &[(&str, &str, &str)] = match schema {
+        BackupSchema::NtMsgExport => &[
+            ("c2c_messages", "direction", "sender_qq"),
+            ("group_messages", "direction", "sender_qq"),
+            ("discuss_messages", "direction", "sender_qq"),
+        ],
+        BackupSchema::NtMsgRaw => &[
+            ("c2c_msg_table", "40013", "40033"),
+            ("group_msg_table", "40013", "40033"),
+            ("discuss_msg_table", "40013", "40033"),
+        ],
+    };
+    let mut candidates = HashMap::<String, u64>::new();
+    for (table, direction_column, sender_column) in tables {
+        if !names.contains(*table) {
+            continue;
+        }
+        let sql = format!(
+            "SELECT CAST(\"{sender_column}\" AS TEXT), COUNT(*) \
+             FROM \"{table}\" WHERE \"{direction_column}\" = 1 \
+             AND \"{sender_column}\" BETWEEN 1000 AND 999999999999 \
+             GROUP BY \"{sender_column}\""
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })?;
+        for row in rows {
+            let (uin, count) = row?;
+            if (4..=12).contains(&uin.len()) && uin.chars().all(|ch| ch.is_ascii_digit()) {
+                *candidates.entry(uin).or_default() += count;
+            }
+        }
+    }
+    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
+    let Some((detected, top_count)) = candidates.first() else {
+        return Ok(None);
+    };
+    let runner_up = candidates.get(1).map_or(0, |candidate| candidate.1);
+    Ok((*top_count > runner_up).then(|| detected.clone()))
+}
+
 fn manifest_path(import_dir: &Path) -> PathBuf {
     import_dir.join("manifest.json")
 }
@@ -571,18 +666,46 @@ fn list_imports_blocking(root: &Path) -> Result<Vec<BackupImport>, BackupImportE
         let Ok(mut manifest) = serde_json::from_slice::<BackupManifest>(&bytes) else {
             continue;
         };
+        let mut manifest_changed = false;
+        if manifest.account_uin.is_none()
+            && manifest.owner_inference_version < OWNER_INFERENCE_VERSION
+        {
+            let database_path = entry.path().join("database.sqlite");
+            match detect_backup_account_uin(&database_path, manifest.schema) {
+                Ok(Some(account_uin)) => {
+                    manifest.account_uin = Some(account_uin);
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "legacy backup import {} has no detectable account owner; keeping it unassigned",
+                        manifest.id
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to infer owner for legacy backup import {}: {error}",
+                        manifest.id
+                    );
+                }
+            }
+            manifest.owner_inference_version = OWNER_INFERENCE_VERSION;
+            manifest_changed = true;
+        }
         if !manifest.includes_discussions {
             let provisional = BackupImport::from(manifest.clone());
             if let Ok(sessions) = list_sessions_for_import(root, &provisional) {
                 manifest.session_count = sessions.len();
                 manifest.message_count = sessions.iter().map(|session| session.message_count).sum();
                 manifest.includes_discussions = true;
-                if let Err(error) = write_manifest(&entry.path(), &manifest) {
-                    tracing::warn!(
-                        "failed to persist upgraded backup manifest for {}: {error}",
-                        manifest.id
-                    );
-                }
+                manifest_changed = true;
+            }
+        }
+        if manifest_changed {
+            if let Err(error) = write_manifest(&entry.path(), &manifest) {
+                tracing::warn!(
+                    "failed to persist upgraded backup manifest for {}: {error}",
+                    manifest.id
+                );
             }
         }
         imports.push(BackupImport::from(manifest));
@@ -1782,7 +1905,7 @@ mod tests {
                     parse_status TEXT NOT NULL, content TEXT
                 );
                 INSERT INTO c2c_messages VALUES
-                    (1, 1700000000, 0, 'u_sender', 10001, 'u_peer', 20002, 2, 1, NULL, NULL, '你好', '{"type":"text","text":"你好"}');
+                    (1, 1700000000, 1, 'u_sender', 10001, 'u_peer', 20002, 2, 1, NULL, NULL, '你好', '{"type":"text","text":"你好"}');
                 INSERT INTO group_messages VALUES
                     (2, 1700000100, 0, 'u_sender', 10001, 'g_internal', 30003, 2, 1, 1, '群消息', 'typed', '{"type":"msg_body","segments":[{"text":"群消息"}]}');
                 "#,
@@ -1837,7 +1960,7 @@ mod tests {
             .expect("create raw schema");
         connection
             .execute(
-                r#"INSERT INTO c2c_msg_table VALUES (?1, ?2, 0, 'u_sender', 'u_deleted', 45678, 10001, 1700000200, '', '发送者', 2, 1, ?3)"#,
+                r#"INSERT INTO c2c_msg_table VALUES (?1, ?2, 1, 'u_sender', 'u_deleted', 45678, 10001, 1700000200, '', '发送者', 2, 1, ?3)"#,
                 params![11_i64, 21_i64, ntqq_text_blob("删除好友的历史消息")],
             )
             .expect("seed raw c2c");
@@ -1869,8 +1992,10 @@ mod tests {
         create_structured_fixture(&source);
         let imports = root.join("imports");
 
-        let imported = import_path_blocking(&imports, &source, None, None).unwrap();
+        let imported =
+            import_path_blocking(&imports, &source, None, None, "10001".to_owned()).unwrap();
         assert_eq!(imported.format, "nt_msg_export");
+        assert_eq!(imported.account_uin, "10001");
         assert_eq!(imported.session_count, 2);
         assert_eq!(imported.message_count, 2);
         assert!(source.exists(), "source file must remain untouched");
@@ -1884,13 +2009,64 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_backup_detected_as_another_account() {
+        let root = temp_root("account-mismatch");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.db");
+        create_structured_fixture(&source);
+        let imports = root.join("imports");
+
+        let error =
+            import_path_blocking(&imports, &source, None, None, "20002".to_owned()).unwrap_err();
+        assert!(matches!(
+            error,
+            BackupImportError::AccountMismatch { detected, current }
+                if detected == "10001" && current == "20002"
+        ));
+        assert_eq!(fs::read_dir(&imports).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manager_only_lists_and_opens_backups_for_the_current_account() {
+        let root = temp_root("account-scope");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.db");
+        create_structured_fixture(&source);
+        let imports = root.join("imports");
+        let imported =
+            import_path_blocking(&imports, &source, None, None, "10001".to_owned()).unwrap();
+        let manager = BackupImportManager::new(imports);
+
+        assert_eq!(
+            manager
+                .list_imports("10001".to_owned())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(manager
+            .list_imports("20002".to_owned())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            manager.get_import("20002".to_owned(), imported.id).await,
+            Err(BackupImportError::NotFound)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn fetches_structured_messages_as_napcat_shape() {
         let root = temp_root("messages");
         fs::create_dir_all(&root).unwrap();
         let source = root.join("source.db");
         create_structured_fixture(&source);
         let imports = root.join("imports");
-        let imported = import_path_blocking(&imports, &source, None, None).unwrap();
+        let imported =
+            import_path_blocking(&imports, &source, None, None, "10001".to_owned()).unwrap();
 
         let page = fetch_messages_blocking(
             &imports,
@@ -1921,8 +2097,10 @@ mod tests {
         create_raw_fixture(&source);
         let imports = root.join("imports");
 
-        let imported = import_path_blocking(&imports, &source, None, None).unwrap();
+        let imported =
+            import_path_blocking(&imports, &source, None, None, "10001".to_owned()).unwrap();
         assert_eq!(imported.format, "nt_msg_raw");
+        assert_eq!(imported.account_uin, "10001");
         assert_eq!(imported.session_count, 3);
         assert_eq!(imported.message_count, 4);
         let sessions = list_sessions_for_import(&imports, &imported).unwrap();
@@ -2008,10 +2186,13 @@ mod tests {
         let source = root.join("nt_msg.db");
         create_raw_fixture(&source);
         let imports = root.join("imports");
-        let imported = import_path_blocking(&imports, &source, None, None).unwrap();
+        let imported =
+            import_path_blocking(&imports, &source, None, None, "10001".to_owned()).unwrap();
         let path = manifest_path(&imports.join(&imported.id));
         let mut legacy: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         let object = legacy.as_object_mut().unwrap();
+        object.remove("accountUin");
+        object.remove("ownerInferenceVersion");
         object.remove("includesDiscussions");
         object.insert("sessionCount".to_owned(), json!(2));
         object.insert("messageCount".to_owned(), json!(3));
@@ -2020,8 +2201,10 @@ mod tests {
         let imports_list = list_imports_blocking(&imports).unwrap();
         assert_eq!(imports_list[0].session_count, 3);
         assert_eq!(imports_list[0].message_count, 4);
+        assert_eq!(imports_list[0].account_uin, "10001");
         let upgraded: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(upgraded["includesDiscussions"], true);
+        assert_eq!(upgraded["accountUin"], "10001");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2091,8 +2274,14 @@ mod tests {
         ));
         let imports = root.join("imports");
 
-        let imported =
-            import_path_blocking(&imports, &source, None, Some(key.to_string())).unwrap();
+        let imported = import_path_blocking(
+            &imports,
+            &source,
+            None,
+            Some(key.to_string()),
+            "10001".to_owned(),
+        )
+        .unwrap();
         assert_eq!(imported.format, "nt_msg_export");
         assert_eq!(imported.session_count, 1);
         assert!(!imports.join(&imported.id).join("encrypted.sqlite").exists());
@@ -2109,7 +2298,8 @@ mod tests {
         fs::write(&source, bytes).unwrap();
         let imports = root.join("imports");
 
-        let error = import_path_blocking(&imports, &source, None, None).unwrap_err();
+        let error =
+            import_path_blocking(&imports, &source, None, None, "10001".to_owned()).unwrap_err();
         assert!(matches!(error, BackupImportError::LegacyBak));
         assert!(!imports.exists());
         fs::remove_dir_all(root).unwrap();

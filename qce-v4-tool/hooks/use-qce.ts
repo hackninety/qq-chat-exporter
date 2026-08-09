@@ -10,7 +10,7 @@ import { useExportTasks, type UseExportTasksProps } from "./use-export-tasks"
  */
 export function useQCE(props?: { onNotification?: UseExportTasksProps['onNotification'] }) {
   const systemInfo = useSystemInfo()
-  const chatData = useChatData()
+  const chatData = useChatData(systemInfo.systemInfo?.napcat.selfInfo?.uin)
   const exportTasks = useExportTasks({ onNotification: props?.onNotification })
 
   // WebSocket integration
@@ -46,7 +46,11 @@ export function useQCE(props?: { onNotification?: UseExportTasksProps['onNotific
   // Load initial data
   useEffect(() => {
     systemInfo.loadSystemInfo()
-  }, [systemInfo.loadSystemInfo])
+    const timer = window.setInterval(() => {
+      void systemInfo.refreshSystemInfo()
+    }, 5000)
+    return () => window.clearInterval(timer)
+  }, [systemInfo.loadSystemInfo, systemInfo.refreshSystemInfo])
 
   // Combined error state
   const hasError = systemInfo.error || chatData.error || exportTasks.error

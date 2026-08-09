@@ -183,6 +183,7 @@ export interface InactiveSessionsResponse {
 
 export interface ChatBackupImport {
   id: string
+  accountUin: string
   fileName: string
   format: 'nt_msg_export' | 'nt_msg_raw'
   createdAt: string

@@ -728,6 +728,75 @@ test.describe('Inactive sessions', () => {
         });
         await expect.poll(() => exportBody?.format).toBe('QCEARCHIVE');
     });
+
+    test('switches imported backup state with the logged-in QQ account', async ({ page }) => {
+        let currentUin = '565122807';
+        let secondAccountImported = false;
+        const backupFor = (uin: string) => ({
+            id: `backup-${uin}`,
+            accountUin: uin,
+            fileName: `nt_msg_${uin}.db`,
+            format: 'nt_msg_raw',
+            createdAt: '2026-08-09T00:00:00Z',
+            fileSize: 4096,
+            sessionCount: uin === '565122807' ? 643 : 707,
+            messageCount: uin === '565122807' ? 1209026 : 3256866,
+        });
+
+        await page.route('**/api/system/info', async (route) => {
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({
+                    success: true,
+                    data: {
+                        name: 'QCE', version: 'test', mode: 'plugin',
+                        napcat: {
+                            version: 'test', online: true,
+                            selfInfo: { uid: `u_${currentUin}`, uin: currentUin, nick: `账号 ${currentUin}` },
+                        },
+                        quickLogin: { enabled: true, account: currentUin, credentialOwner: 'qqnt' },
+                        runtime: { nodeVersion: 'test', platform: 'win32', arch: 'x64', uptime: 1, memory: 1 },
+                    },
+                }),
+            });
+        });
+        await page.route('**/api/chat-backups', async (route, request) => {
+            if (request.method() !== 'GET') {
+                await route.continue();
+                return;
+            }
+            const imports = currentUin === '565122807'
+                ? [backupFor(currentUin)]
+                : secondAccountImported ? [backupFor(currentUin)] : [];
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({ success: true, data: { imports } }),
+            });
+        });
+
+        await authenticate(page);
+        const response = await page.goto(`${FRONTEND_BASE}/qce/inactive/`).catch(() => null);
+        test.skip(!response || response.status() >= 500, `frontend not reachable at ${FRONTEND_BASE}`);
+
+        await expect(page.getByText(/当前 QQ 565122807/)).toBeVisible({ timeout: 15_000 });
+        await expect(page.getByText(/nt_msg_565122807\.db/)).toBeVisible();
+
+        currentUin = '10767044';
+        await expect(page.getByText(/当前 QQ 10767044/)).toBeVisible({ timeout: 10_000 });
+        await expect(page.getByText(/nt_msg_565122807\.db/)).toHaveCount(0);
+        await expect(page.getByTestId('inactive-account-export-button')).toBeDisabled();
+
+        secondAccountImported = true;
+        await page.getByRole('button', { name: '刷新导入的聊天记录' }).click();
+        await expect(page.getByText(/nt_msg_10767044\.db/)).toBeVisible();
+
+        currentUin = '565122807';
+        await expect(page.getByText(/当前 QQ 565122807/)).toBeVisible({ timeout: 10_000 });
+        await expect(page.getByText(/nt_msg_565122807\.db/)).toBeVisible();
+        await expect(page.getByText(/nt_msg_10767044\.db/)).toHaveCount(0);
+    });
 });
 
 test.describe('Account archive exports', () => {

@@ -6,6 +6,7 @@ use axum::response::Response;
 use futures_util::future::join_all;
 use serde_json::{json, Value};
 
+use crate::api::helpers::current_account_uin;
 use crate::api::response::{self, ApiError, ErrorType, RequestId};
 use crate::api::state::SharedState;
 use crate::backup_import::ImportedSession;
@@ -792,7 +793,11 @@ pub async fn inactive_sessions(
         .collect();
     enrich_contact_names(&mut contacts, &state, true).await;
     let mut sessions = build_inactive_sessions(&contacts, &friend_ids, &active_group_codes);
-    let imported_sessions = match state.backup_import_manager.list_sessions().await {
+    let account_uin = match current_account_uin(&state.napcat).await {
+        Ok(account_uin) => account_uin,
+        Err(error) => return response::error(&error, &request_id),
+    };
+    let imported_sessions = match state.backup_import_manager.list_sessions(account_uin).await {
         Ok(sessions) => sessions,
         Err(error) => {
             tracing::warn!(

@@ -3,11 +3,41 @@ use std::time::Duration;
 
 use qce_exporter::CleanMessage;
 
+use crate::api::response::{ApiError, ErrorType};
 use crate::fetcher::is_private_like_chat_type;
 use crate::napcat::NapCatBridgeClient;
 
 /// 单步查询超时，单位为毫秒。
 const SESSION_NAME_TIMEOUT_MS: u64 = 2000;
+
+/// 读取当前登录账号。备份导入和读取都以此作为服务端隔离边界，不能信任前端传入账号。
+pub async fn current_account_uin(napcat: &NapCatBridgeClient) -> Result<String, ApiError> {
+    let self_info = napcat.self_info().await.map_err(|error| {
+        ApiError::new(
+            ErrorType::Auth,
+            format!("当前 QQ 账号尚未登录或账号资料不可用: {error}"),
+            "ACCOUNT_NOT_LOGGED_IN",
+        )
+    })?;
+    let uin = ["uin", "qq"]
+        .into_iter()
+        .find_map(|key| match self_info.get(key) {
+            Some(Value::String(value)) => Some(value.trim().to_owned()),
+            Some(Value::Number(value)) => Some(value.to_string()),
+            _ => None,
+        })
+        .filter(|value| {
+            (4..=12).contains(&value.len()) && value.chars().all(|ch| ch.is_ascii_digit())
+        })
+        .ok_or_else(|| {
+            ApiError::new(
+                ErrorType::Auth,
+                "当前 QQ 账号尚未登录或账号号码无效",
+                "ACCOUNT_NOT_LOGGED_IN",
+            )
+        })?;
+    Ok(uin)
+}
 
 /// 宽松转数字。
 fn to_number(value: Option<&Value>) -> i64 {

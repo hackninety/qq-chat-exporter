@@ -7,6 +7,7 @@ use axum::response::Response;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
+use crate::api::helpers::current_account_uin;
 use crate::api::response::{self, ApiError, ErrorType, RequestId};
 use crate::api::state::SharedState;
 use crate::backup_import::{BackupImportError, KeyDetectionError};
@@ -95,7 +96,11 @@ pub async fn list_backups(
     State(state): State<SharedState>,
     Extension(RequestId(request_id)): Extension<RequestId>,
 ) -> Response {
-    match state.backup_import_manager.list_imports().await {
+    let account_uin = match current_account_uin(&state.napcat).await {
+        Ok(account_uin) => account_uin,
+        Err(error) => return response::error(&error, &request_id),
+    };
+    match state.backup_import_manager.list_imports(account_uin).await {
         Ok(imports) => response::success(json!({ "imports": imports }), &request_id),
         Err(error) => response::error(&import_error(error), &request_id),
     }
@@ -106,7 +111,11 @@ pub async fn list_backup_sessions(
     State(state): State<SharedState>,
     Extension(RequestId(request_id)): Extension<RequestId>,
 ) -> Response {
-    match state.backup_import_manager.list_sessions().await {
+    let account_uin = match current_account_uin(&state.napcat).await {
+        Ok(account_uin) => account_uin,
+        Err(error) => return response::error(&error, &request_id),
+    };
+    match state.backup_import_manager.list_sessions(account_uin).await {
         Ok(sessions) => response::success(
             json!({ "totalCount": sessions.len(), "sessions": sessions }),
             &request_id,
@@ -263,6 +272,10 @@ pub async fn upload_backup(
     Extension(RequestId(request_id)): Extension<RequestId>,
     mut multipart: Multipart,
 ) -> Response {
+    let account_uin = match current_account_uin(&state.napcat).await {
+        Ok(account_uin) => account_uin,
+        Err(error) => return response::error(&error, &request_id),
+    };
     let upload_id = uuid::Uuid::new_v4().simple().to_string();
     let temporary_path = state
         .backup_import_manager
@@ -375,7 +388,7 @@ pub async fn upload_backup(
     } else if let Some(path) = uploaded_path {
         match state
             .backup_import_manager
-            .import_path(path, original_name, key)
+            .import_path(path, original_name, key, account_uin)
             .await
         {
             Ok(imported) => response::success(json!({ "import": imported }), &request_id),

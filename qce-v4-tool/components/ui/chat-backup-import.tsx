@@ -18,6 +18,7 @@ import { Input } from "./input"
 import { Loader } from "./loader"
 
 interface ChatBackupImportProps {
+  accountUin?: string
   imports: ChatBackupImport[]
   loading: boolean
   importing: boolean
@@ -37,6 +38,7 @@ function formatSize(bytes: number): string {
 }
 
 export function ChatBackupImportSection({
+  accountUin,
   imports,
   loading,
   importing,
@@ -111,7 +113,7 @@ export function ChatBackupImportSection({
         <div>
           <h2 className="text-[15px] font-semibold text-foreground">导入的聊天记录备份</h2>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground/70">
-            直接解析备份数据库中的历史私聊和群聊，不依赖当前 QQ 会话列表。
+            当前 QQ {accountUin || "未登录"}；这里只显示并使用该账号导入的历史私聊和群聊。
           </p>
         </div>
         <div className="flex items-center gap-2">

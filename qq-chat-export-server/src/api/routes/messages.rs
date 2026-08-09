@@ -21,8 +21,8 @@ use qce_exporter::types::MessageResource;
 use qce_exporter::{ChatInfo, CleanMessage, ExportOptions};
 
 use crate::api::helpers::{
-    backfill_self_sender_names, chat_avatar_url, resolve_peer_uid, resolve_peer_uin,
-    resolve_session_name,
+    backfill_self_sender_names, chat_avatar_url, current_account_uin, resolve_peer_uid,
+    resolve_peer_uin, resolve_session_name,
 };
 use crate::api::response::{self, ApiError, ErrorType, RequestId};
 use crate::api::state::{MessageCacheEntry, SharedState, CACHE_EXPIRE_TIME_MS};
@@ -462,6 +462,10 @@ pub async fn fetch_messages(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
+        let account_uin = match current_account_uin(&state.napcat).await {
+            Ok(account_uin) => account_uin,
+            Err(error) => return response::error(&error, &request_id),
+        };
         let search = body
             .get("searchQuery")
             .or_else(|| filter.get("searchQuery"))
@@ -470,6 +474,7 @@ pub async fn fetch_messages(
         return match state
             .backup_import_manager
             .fetch_messages(
+                account_uin,
                 import_id.to_string(),
                 chat_type,
                 peer_uid,
@@ -1634,9 +1639,13 @@ async fn process_export_task(
 
     let is_backup_import = req.backup_import_id.is_some();
     let mut all_messages: Vec<Value> = if let Some(import_id) = &req.backup_import_id {
+        let account_uin = current_account_uin(&state.napcat)
+            .await
+            .map_err(|error| error.to_string())?;
         let messages = state
             .backup_import_manager
             .fetch_all_messages(
+                account_uin,
                 import_id.clone(),
                 req.chat_type,
                 req.peer_uid.clone(),

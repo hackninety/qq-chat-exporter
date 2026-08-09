@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react"
+import { useState, useCallback, useRef } from "react"
 import type { AccountLogoutResult, SystemInfo } from "@/types/api"
 import { useApi } from "./use-api"
 
@@ -7,27 +7,38 @@ export function useSystemInfo() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const { apiCall } = useApi()
+  const requestSequence = useRef(0)
+  const loadingRequestSequence = useRef(0)
 
-  const loadSystemInfo = useCallback(async () => {
+  const requestSystemInfo = useCallback(async (silent: boolean) => {
+    const requestId = requestSequence.current + 1
+    requestSequence.current = requestId
     try {
-      setLoading(true)
-      setError(null)
+      if (!silent) {
+        loadingRequestSequence.current = requestId
+        setLoading(true)
+        setError(null)
+      }
       const response = await apiCall<SystemInfo>("/api/system/info")
-      if (response.success && response.data) {
+      if (requestSequence.current === requestId && response.success && response.data) {
         setSystemInfo(response.data)
       }
     } catch (err) {
       const errorMessage = `加载系统信息失败: ${err instanceof Error ? err.message : "未知错误"}`
-      setError(errorMessage)
+      if (!silent && requestSequence.current === requestId) setError(errorMessage)
       console.error("[QCE] System info error:", err)
     } finally {
-      setLoading(false)
+      if (!silent && loadingRequestSequence.current === requestId) setLoading(false)
     }
   }, [apiCall])
 
-  const refreshSystemInfo = useCallback(() => {
-    loadSystemInfo()
-  }, [loadSystemInfo])
+  const loadSystemInfo = useCallback(async () => {
+    await requestSystemInfo(false)
+  }, [requestSystemInfo])
+
+  const refreshSystemInfo = useCallback(async () => {
+    await requestSystemInfo(true)
+  }, [requestSystemInfo])
 
   const logoutAccount = useCallback(async () => {
     const response = await apiCall<AccountLogoutResult>("/api/system/logout", {

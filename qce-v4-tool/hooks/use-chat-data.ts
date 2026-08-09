@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react"
+import { useState, useCallback, useEffect, useRef } from "react"
 import type { Group, Friend, GroupsResponse, FriendsResponse, RecentContactsResponse } from "@/types/api"
 import { useApi } from "./use-api"
 import { buildSpecialFriends } from "@/lib/special-contacts"
@@ -16,7 +16,7 @@ export interface AvatarExportResult {
   downloadUrl: string
 }
 
-export function useChatData() {
+export function useChatData(accountUin?: string) {
   const [groups, setGroups] = useState<Group[]>([])
   const [friends, setFriends] = useState<Friend[]>([])
   const [loading, setLoading] = useState(false)
@@ -30,9 +30,22 @@ export function useChatData() {
    */
   const [recentActivityMap, setRecentActivityMap] = useState<Record<string, string>>({})
   const { apiCall } = useApi()
+  const accountUinRef = useRef(accountUin)
+
+  useEffect(() => {
+    accountUinRef.current = accountUin
+    setGroups([])
+    setFriends([])
+    setRecentActivityMap({})
+    setLoadProgress(null)
+    setError(null)
+    setLoading(false)
+  }, [accountUin])
 
   // 自动分页加载所有群组
   const loadGroups = useCallback(async (page = 1, limit = 1000) => {
+    const requestedAccountUin = accountUinRef.current
+    if (!requestedAccountUin) return
     try {
       setLoading(true)
       setError(null)
@@ -43,6 +56,7 @@ export function useChatData() {
 
       while (hasMore) {
         const response = await apiCall<GroupsResponse>(`/api/groups?page=${currentPage}&limit=${limit}`)
+        if (accountUinRef.current !== requestedAccountUin) return
 
         if (response.success && response.data) {
           const pageGroups = response.data.groups || []
@@ -64,22 +78,26 @@ export function useChatData() {
         }
       }
 
+      if (accountUinRef.current !== requestedAccountUin) return
       setGroups(allGroups)
       setLoadProgress(null)
       console.log(`[QCE] 已加载 ${allGroups.length} 个群组`)
 
     } catch (err) {
       const errorMessage = `加载群组失败: ${err instanceof Error ? err.message : "未知错误"}`
+      if (accountUinRef.current !== requestedAccountUin) return
       setError(errorMessage)
       console.error("[QCE] Groups load error:", err)
       setLoadProgress(null)
     } finally {
-      setLoading(false)
+      if (accountUinRef.current === requestedAccountUin) setLoading(false)
     }
   }, [apiCall])
 
   // 自动分页加载所有好友
   const loadFriends = useCallback(async (page = 1, limit = 1000) => {
+    const requestedAccountUin = accountUinRef.current
+    if (!requestedAccountUin) return
     try {
       setLoading(true)
       setError(null)
@@ -90,6 +108,7 @@ export function useChatData() {
 
       while (hasMore) {
         const response = await apiCall<FriendsResponse>(`/api/friends?page=${currentPage}&limit=${limit}`)
+        if (accountUinRef.current !== requestedAccountUin) return
 
         if (response.success && response.data) {
           const pageFriends = response.data.friends || []
@@ -117,6 +136,7 @@ export function useChatData() {
       // 普通好友（chatType=1）。失败时静默跳过，不影响普通好友加载。
       try {
         const recentResp = await apiCall<RecentContactsResponse>("/api/recent-contacts?limit=500&includeAll=true")
+        if (accountUinRef.current !== requestedAccountUin) return
         if (recentResp.success && recentResp.data) {
           // Issue #344: 根据 peerUid 记下最近一条消息时间，供会话列表「按最近
           // 活跃」排序 以及小徽标显示。
@@ -140,30 +160,34 @@ export function useChatData() {
         console.warn("[QCE] 加载最近联系人失败，跳过特殊会话合并:", recentErr)
       }
 
+      if (accountUinRef.current !== requestedAccountUin) return
       setFriends(allFriends)
       setLoadProgress(null)
       console.log(`[QCE] 已加载 ${allFriends.length} 个好友`)
 
     } catch (err) {
       const errorMessage = `加载好友失败: ${err instanceof Error ? err.message : "未知错误"}`
+      if (accountUinRef.current !== requestedAccountUin) return
       setError(errorMessage)
       console.error("[QCE] Friends load error:", err)
       setLoadProgress(null)
     } finally {
-      setLoading(false)
+      if (accountUinRef.current === requestedAccountUin) setLoading(false)
     }
   }, [apiCall])
 
   const loadAll = useCallback(async () => {
+    const requestedAccountUin = accountUinRef.current
+    if (!requestedAccountUin) return
     try {
       setLoading(true)
       setError(null)
       await Promise.all([loadGroups(), loadFriends()])
     } catch (err) {
       const errorMessage = `加载数据失败: ${err instanceof Error ? err.message : "未知错误"}`
-      setError(errorMessage)
+      if (accountUinRef.current === requestedAccountUin) setError(errorMessage)
     } finally {
-      setLoading(false)
+      if (accountUinRef.current === requestedAccountUin) setLoading(false)
     }
   }, [loadGroups, loadFriends])
 
