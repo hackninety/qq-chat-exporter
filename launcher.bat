@@ -50,12 +50,8 @@ if defined QCE_SERVER_WINDOWS_X64 (
 ) else if defined QCE_SERVER_BINARY (
     echo [QCE] Using server binary: "%QCE_SERVER_BINARY%"
 ) else (
-    where cargo >nul 2>&1
-    if errorlevel 1 (
-        echo [Error] Rust/Cargo was not found and no compiled QCE server is available.
-        echo         Build qq-chat-export-server once, or install Rust from https://rustup.rs/.
-        goto :failed
-    )
+    call :prepare_cargo
+    if errorlevel 1 goto :failed
 )
 
 set "QCE_PYTHON_KIND="
@@ -183,6 +179,41 @@ if exist "%QCE_PACKAGE_DIR%\config" (
 )
 if defined NAPCAT_QUICK_ACCOUNT powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='SilentlyContinue'; $parent=Split-Path -Parent $env:QCE_QUICK_LOGIN_FILE; New-Item -ItemType Directory -Force -Path $parent | Out-Null; [IO.File]::WriteAllText($env:QCE_QUICK_LOGIN_FILE, (@{schemaVersion=1;uin=$env:NAPCAT_QUICK_ACCOUNT;updatedAt=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json), [Text.UTF8Encoding]::new($false))"
 exit /b 0
+
+:prepare_cargo
+set "QCE_CARGO_EXE="
+if not defined QCE_CARGO goto :detect_cargo
+if not exist "%QCE_CARGO%" goto :invalid_cargo_override
+set "QCE_CARGO_EXE=%QCE_CARGO%"
+goto :cargo_found
+
+:invalid_cargo_override
+echo [Error] QCE_CARGO does not point to a file: "%QCE_CARGO%"
+exit /b 1
+
+:detect_cargo
+for /f "delims=" %%i in ('where cargo 2^>nul') do if not defined QCE_CARGO_EXE set "QCE_CARGO_EXE=%%i"
+if defined QCE_CARGO_EXE goto :cargo_found
+if defined CARGO_HOME if exist "%CARGO_HOME%\bin\cargo.exe" set "QCE_CARGO_EXE=%CARGO_HOME%\bin\cargo.exe"
+if defined QCE_CARGO_EXE goto :cargo_found
+if exist "%USERPROFILE%\.cargo\bin\cargo.exe" set "QCE_CARGO_EXE=%USERPROFILE%\.cargo\bin\cargo.exe"
+if defined QCE_CARGO_EXE goto :cargo_found
+
+echo [Error] Rust/Cargo was not found and no compiled QCE server is available.
+echo         Checked PATH, CARGO_HOME and "%USERPROFILE%\.cargo\bin\cargo.exe".
+echo         Install Rust from https://rustup.rs/ or set QCE_CARGO to cargo.exe.
+exit /b 1
+
+:cargo_found
+"%QCE_CARGO_EXE%" --version >nul 2>&1
+if errorlevel 1 goto :cargo_not_working
+for %%i in ("%QCE_CARGO_EXE%") do set "PATH=%%~dpi;%PATH%"
+echo [QCE] Using Rust/Cargo: "%QCE_CARGO_EXE%"
+exit /b 0
+
+:cargo_not_working
+echo [Error] Rust/Cargo is not working: "%QCE_CARGO_EXE%"
+exit /b 1
 
 :detect_stale_package
 set "QCE_PACKAGE_STALE=0"
